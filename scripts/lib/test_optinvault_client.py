@@ -19,6 +19,13 @@ class _Response:
 
 
 class OptInVaultClientTest(unittest.TestCase):
+    def test_rejects_cleartext_remote_base_url(self):
+        with self.assertRaisesRegex(ValueError, "HTTPS"):
+            OptInVaultClient(
+                "http://vault.example",
+                site_key="oiv_pk_" + "f" * 43,
+            )
+
     def test_log_consent_uses_stdlib_request_shape_without_tenant_identity(self):
         captured = {}
 

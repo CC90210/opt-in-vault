@@ -19,6 +19,26 @@
     return crypto.randomUUID();
   }
 
+  function captureEndpoint(value) {
+    var endpoint = new URL(value || "/api/v1/consent/log", location.href);
+    var localHost =
+      endpoint.hostname === "localhost" ||
+      endpoint.hostname === "127.0.0.1" ||
+      endpoint.hostname === "[::1]";
+    if (
+      (endpoint.protocol !== "https:" &&
+        !(endpoint.protocol === "http:" && localHost)) ||
+      endpoint.username ||
+      endpoint.password ||
+      endpoint.hash
+    ) {
+      throw new TypeError(
+        "The consent endpoint must use HTTPS (HTTP is allowed only on loopback).",
+      );
+    }
+    return endpoint.toString();
+  }
+
   async function capture(input) {
     if (!input || typeof input !== "object") throw new TypeError("Capture options are required.");
     var siteKey = requiredString("siteKey", input.siteKey, 64);
@@ -27,10 +47,7 @@
     if (!ACTION.test(action)) throw new TypeError("affirmativeAction is invalid.");
     if (!input.email && !input.phone) throw new TypeError("An email or phone value is required.");
 
-    var endpoint = new URL(
-      input.endpoint || "/api/v1/consent/log",
-      location.href,
-    ).toString();
+    var endpoint = captureEndpoint(input.endpoint);
     var payload = {
       disclosure_version: requiredString("disclosureVersion", input.disclosureVersion, 128),
       affirmative_action: action,

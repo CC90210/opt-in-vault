@@ -34,6 +34,8 @@ def _http_base_url(value: str) -> str:
         or parsed.fragment
     ):
         raise ValueError("base_url must be an HTTP(S) URL without credentials, query, or fragment")
+    if parsed.scheme != "https" and parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
+        raise ValueError("base_url must use HTTPS (HTTP is allowed only on loopback)")
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
 
 

@@ -51,4 +51,32 @@ describe("browser consent SDK", () => {
     expect(source).not.toContain("oiv_sk_");
     expect(source).not.toMatch(/secret|private[_-]?key/i);
   });
+
+  it("refuses cleartext remote capture endpoints before transmitting evidence", async () => {
+    const source = await readFile(join(process.cwd(), "public/v1/optinvault.js"), "utf8");
+    const fetch = vi.fn();
+    const window = {} as Record<string, unknown>;
+    vm.runInNewContext(source, {
+      window,
+      fetch,
+      URL,
+      crypto: { randomUUID: () => "12345678-1234-1234-1234-123456789012" },
+      location: { href: "https://example.test/signup", origin: "https://example.test" },
+      console,
+    });
+    const sdk = window.OptInVault as {
+      capture(input: Record<string, unknown>): Promise<unknown>;
+    };
+
+    await expect(
+      sdk.capture({
+        endpoint: "http://vault.example/api/v1/consent/log",
+        siteKey: `oiv_pk_${"e".repeat(43)}`,
+        disclosureVersion: "v1",
+        affirmativeAction: "form_submit",
+        email: "person@example.test",
+      }),
+    ).rejects.toThrow(/https/i);
+    expect(fetch).not.toHaveBeenCalled();
+  });
 });
