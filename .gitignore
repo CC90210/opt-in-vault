@@ -43,6 +43,14 @@ yarn-error.log*
 *.keystore
 client_secret*.json
 service-account*.json
+service_account*.json
+credentials.json
+*.token
+*_token.txt
+*_token.json
+.long_lived_token*
+id_rsa
+id_ed25519
 
 # local databases and generated evidence
 /data/

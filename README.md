@@ -6,7 +6,7 @@ Opt-in Vault is a private, multi-workspace outbound and consent-evidence platfor
 
 Requirements: Node.js 20 or newer and npm.
 
-```bash
+```powershell
 npm install
 Copy-Item .env.example .env.local
 npm run dev
