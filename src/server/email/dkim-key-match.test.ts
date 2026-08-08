@@ -51,6 +51,18 @@ function snapshot(
   };
 }
 
+function snapshotWithDkimRecord(
+  publicKey: string,
+  dkimRecord: string,
+): LocalDkimDnsSnapshot {
+  const base = snapshot(publicKey);
+  const document = JSON.parse(base.dnsCheckRecordsJson!) as {
+    records: { dkim: string[] };
+  };
+  document.records.dkim = [dkimRecord];
+  return { ...base, dnsCheckRecordsJson: JSON.stringify(document) };
+}
+
 describe("local DKIM key ownership gate", () => {
   it("accepts a fresh DNS snapshot whose normalized RSA SPKI matches the private key", () => {
     const key = rsaFixture();
@@ -79,6 +91,54 @@ describe("local DKIM key ownership gate", () => {
         now: NOW,
       }),
     ).toThrow(expect.objectContaining({ code: "local_dkim_key_mismatch" }));
+  });
+
+  it.each([
+    ["h=sha1", (key: string) => `v=DKIM1; h=sha1; k=rsa; p=${key}`],
+    ["s=other", (key: string) => `v=DKIM1; s=other; k=rsa; p=${key}`],
+    [
+      "duplicate tags",
+      (key: string) => `v=DKIM1; h=sha256; h=sha256; k=rsa; p=${key}`,
+    ],
+    [
+      "an empty colon-list item",
+      (key: string) => `v=DKIM1; s=other::email; k=rsa; p=${key}`,
+    ],
+  ])("rejects %s in the live DNS key matcher", (_name, recordFor) => {
+    const key = rsaFixture();
+
+    expect(() =>
+      assertLocalDkimKeyMatchesDns({
+        privateKey: key.privateKey,
+        sendingDomain: "example.com",
+        dkimSelector: "outbound",
+        snapshot: snapshotWithDkimRecord(key.publicKey, recordFor(key.publicKey)),
+        now: NOW,
+      }),
+    ).toThrow(expect.objectContaining({ code: "local_dkim_dns_record_invalid" }));
+  });
+
+  it.each([
+    [
+      "h=sha1:sha256",
+      (key: string) => `v=DKIM1; h=SHA1 : SHA256; k=rsa; p=${key}`,
+    ],
+    [
+      "s=other:email",
+      (key: string) => `v=DKIM1; s=other : EMAIL; k=rsa; p=${key}`,
+    ],
+  ])("accepts %s in the live DNS key matcher", (_name, recordFor) => {
+    const key = rsaFixture();
+
+    expect(() =>
+      assertLocalDkimKeyMatchesDns({
+        privateKey: key.privateKey,
+        sendingDomain: "example.com",
+        dkimSelector: "outbound",
+        snapshot: snapshotWithDkimRecord(key.publicKey, recordFor(key.publicKey)),
+        now: NOW,
+      }),
+    ).not.toThrow();
   });
 
   it("rejects stale, mismatched, and unhealthy DNS snapshots", () => {

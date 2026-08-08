@@ -161,6 +161,86 @@ function tag(record: string, name: string): string | null {
   return match?.[1]?.trim() ?? null;
 }
 
+export type ParsedDkimKeyRecord = {
+  algorithm: string;
+  publicKey: string;
+};
+
+function colonSeparatedTagValues(
+  value: string,
+  allowWildcard: boolean,
+): string[] | null {
+  const parts = value.split(":");
+  if (parts.length === 0 || parts.length > 32) return null;
+  const normalized = parts.map((part) => part.trim().toLowerCase());
+  const hyphenatedWord = /^[a-z](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
+  return normalized.every(
+    (part) => (allowWildcard && part === "*") || hyphenatedWord.test(part),
+  )
+    ? normalized
+    : null;
+}
+
+export function parseDkimKeyRecord(record: string): ParsedDkimKeyRecord | null {
+  if (
+    !record ||
+    Buffer.byteLength(record, "utf8") > 4_096 ||
+    /[\r\n\u0000]/.test(record)
+  ) {
+    return null;
+  }
+
+  const segments = record.split(";");
+  if (segments.at(-1)?.trim() === "") segments.pop();
+  if (segments.length === 0 || segments.length > 64) return null;
+
+  const tags = new Map<string, string>();
+  for (const segment of segments) {
+    const normalized = segment.trim();
+    const separator = normalized.indexOf("=");
+    if (separator <= 0) return null;
+    const name = normalized.slice(0, separator).trim();
+    const value = normalized.slice(separator + 1).trim();
+    if (
+      !/^[A-Za-z][A-Za-z0-9_]*$/.test(name) ||
+      tags.has(name) ||
+      /[^\t\x20-\x3A\x3C-\x7E]/.test(value)
+    ) {
+      return null;
+    }
+    tags.set(name, value);
+  }
+
+  if (
+    segments[0].slice(0, segments[0].indexOf("=")).trim() !== "v" ||
+    tags.get("v") !== "DKIM1"
+  ) {
+    return null;
+  }
+
+  const hashes = tags.has("h")
+    ? colonSeparatedTagValues(tags.get("h")!, false)
+    : null;
+  if (tags.has("h") && (!hashes || !hashes.includes("sha256"))) return null;
+
+  const services = tags.has("s")
+    ? colonSeparatedTagValues(tags.get("s")!, true)
+    : null;
+  if (
+    tags.has("s") &&
+    (!services || (!services.includes("*") && !services.includes("email")))
+  ) {
+    return null;
+  }
+
+  const publicKey = tags.get("p");
+  if (!publicKey) return null;
+  return {
+    algorithm: (tags.get("k") ?? "rsa").toLowerCase(),
+    publicKey,
+  };
+}
+
 function spfStatus(records: string[]): string {
   if (records.length === 0) return "missing";
   if (records.length > 1) return "multiple_records";
@@ -210,16 +290,15 @@ function spfStatus(records: string[]): string {
 }
 
 function validDkimPublicKey(record: string): boolean {
-  const algorithm = (tag(record, "k") ?? "rsa").toLowerCase();
-  const raw = tag(record, "p");
-  if (!raw || !/^[A-Za-z0-9+/]+={0,2}$/.test(raw)) return false;
+  const parsed = parseDkimKeyRecord(record);
+  if (!parsed || !/^[A-Za-z0-9+/]+={0,2}$/.test(parsed.publicKey)) return false;
   try {
-    const unpadded = raw.replace(/=+$/, "");
+    const unpadded = parsed.publicKey.replace(/=+$/, "");
     const padded = `${unpadded}${"=".repeat((4 - (unpadded.length % 4)) % 4)}`;
     const decoded = Buffer.from(padded, "base64");
     if (decoded.toString("base64").replace(/=+$/, "") !== unpadded) return false;
-    if (algorithm === "ed25519") return decoded.length === 32;
-    if (algorithm !== "rsa") return false;
+    if (parsed.algorithm === "ed25519") return decoded.length === 32;
+    if (parsed.algorithm !== "rsa") return false;
     for (const type of ["spki", "pkcs1"] as const) {
       try {
         const key = createPublicKey({ key: decoded, format: "der", type });

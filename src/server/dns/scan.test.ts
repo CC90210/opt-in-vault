@@ -58,6 +58,49 @@ describe("DNS health scanner", () => {
     });
   });
 
+  it.each([
+    ["h=sha1", `v=DKIM1; h=sha1; k=rsa; p=${VALID_DKIM_KEY}`, false],
+    [
+      "h=sha1:sha256",
+      `v=DKIM1; h=SHA1 : SHA256; k=rsa; p=${VALID_DKIM_KEY}`,
+      true,
+    ],
+    ["s=other", `v=DKIM1; s=other; k=rsa; p=${VALID_DKIM_KEY}`, false],
+    [
+      "s=other:email",
+      `v=DKIM1; s=other : EMAIL; k=rsa; p=${VALID_DKIM_KEY}`,
+      true,
+    ],
+    [
+      "duplicate tags",
+      `v=DKIM1; h=sha256; h=sha256; k=rsa; p=${VALID_DKIM_KEY}`,
+      false,
+    ],
+    [
+      "an empty colon-list item",
+      `v=DKIM1; h=sha1::sha256; k=rsa; p=${VALID_DKIM_KEY}`,
+      false,
+    ],
+  ])("enforces the DKIM %s restriction", async (_name, dkimRecord, accepted) => {
+    const result = await scanDnsHealth(
+      { domain: "example.com", dkimSelector: "selector", dkimMode: "local" },
+      resolver({
+        resolveTxt: vi.fn(async (name: string) => {
+          if (name === "example.com") {
+            return [["v=spf1 include:_spf.example.net -all"]];
+          }
+          if (name.includes("._domainkey.")) return [[dkimRecord]];
+          return [["v=DMARC1; p=quarantine"]];
+        }),
+      }),
+    );
+
+    expect(result.sendReady).toBe(accepted);
+    expect(result.dkimStatus).toBe(
+      accepted ? "present_local_key" : "invalid_public_key",
+    );
+  });
+
   it("reports a monitoring-only DMARC policy as degraded but send-ready", async () => {
     const result = await scanDnsHealth(
       { domain: "example.com", dkimSelector: "selector", dkimMode: "provider" },

@@ -9,6 +9,7 @@ import {
 } from "node:crypto";
 
 import { DNS_FRESHNESS_MS } from "@/server/dns/freshness";
+import { parseDkimKeyRecord } from "@/server/dns/scan";
 
 const MAX_DNS_SNAPSHOT_BYTES = 2 * 1_024 * 1_024;
 const MAX_DKIM_RECORD_BYTES = 4_096;
@@ -83,26 +84,6 @@ function readSingleDkimRecord(
   return dkim[0];
 }
 
-function dkimTags(record: string): Map<string, string> {
-  const tags = new Map<string, string>();
-  for (const segment of record.split(";")) {
-    const normalized = segment.trim();
-    if (!normalized) continue;
-    const separator = normalized.indexOf("=");
-    if (separator <= 0) fail("local_dkim_dns_record_invalid");
-    const name = normalized.slice(0, separator).trim().toLowerCase();
-    const value = normalized.slice(separator + 1).trim();
-    if (!/^[a-z][a-z0-9]*$/.test(name) || tags.has(name)) {
-      fail("local_dkim_dns_record_invalid");
-    }
-    tags.set(name, value);
-  }
-  if (tags.get("v")?.toLowerCase() !== "dkim1") {
-    fail("local_dkim_dns_record_invalid");
-  }
-  return tags;
-}
-
 function decodeCanonicalBase64(value: string): Buffer {
   if (!value || !/^[A-Za-z0-9+/]+={0,2}$/.test(value)) {
     fail("local_dkim_dns_record_invalid");
@@ -131,11 +112,12 @@ function requireRsaKey(key: KeyObject, code: string): KeyObject {
 }
 
 function normalizedDnsSpki(record: string): Buffer {
-  const tags = dkimTags(record);
-  if ((tags.get("k") ?? "rsa").toLowerCase() !== "rsa") {
+  const parsed = parseDkimKeyRecord(record);
+  if (!parsed) fail("local_dkim_dns_record_invalid");
+  if (parsed.algorithm !== "rsa") {
     fail("local_dkim_public_key_unsupported");
   }
-  const decoded = decodeCanonicalBase64(tags.get("p") ?? "");
+  const decoded = decodeCanonicalBase64(parsed.publicKey);
   for (const type of ["spki", "pkcs1"] as const) {
     try {
       const key = requireRsaKey(
