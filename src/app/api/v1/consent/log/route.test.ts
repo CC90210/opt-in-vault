@@ -5,6 +5,7 @@ import { ConsentCaptureError, type ConsentCaptureResult } from "@/server/consent
 import { createConsentLogHandlers } from "./handler";
 
 const SITE_KEY = `oiv_pk_${"b".repeat(43)}`;
+const MAX_BODY_BYTES = 32 * 1_024;
 const captureResult: ConsentCaptureResult = {
   created: true,
   consentId: "consent-1",
@@ -36,6 +37,30 @@ function request(headers: Record<string, string> = {}, body: Record<string, unkn
       ...body,
     }),
   });
+}
+
+function streamedRequest(
+  chunks: Uint8Array[],
+  headers: Record<string, string> = {},
+): Request {
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(chunk);
+      controller.close();
+    },
+  });
+  return new Request("https://vault.example/api/v1/consent/log", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      origin: "https://example.test",
+      "idempotency-key": "idem-stream-0001",
+      "x-optinvault-site-key": SITE_KEY,
+      ...headers,
+    },
+    body: stream,
+    duplex: "half",
+  } as RequestInit & { duplex: "half" });
 }
 
 describe("POST /api/v1/consent/log", () => {
@@ -112,5 +137,79 @@ describe("POST /api/v1/consent/log", () => {
       expect(response.headers.get("x-robots-tag")).toContain("noindex");
       expect(await response.json()).toEqual({ error: code });
     }
+  });
+
+  it("enforces the byte cap incrementally when Content-Length is missing", async () => {
+    const capture = vi.fn().mockResolvedValue(captureResult);
+    const handlers = createConsentLogHandlers({ capture });
+    const streamed = streamedRequest([
+      new Uint8Array(MAX_BODY_BYTES).fill(0x20),
+      new Uint8Array([0x20]),
+    ]);
+    expect(streamed.headers.get("content-length")).toBeNull();
+    const response = await handlers.POST(streamed);
+
+    expect(response.status).toBe(413);
+    expect(response.headers.get("cache-control")).toContain("no-store");
+    expect(capture).not.toHaveBeenCalled();
+  });
+
+  it("requires the exact JSON media type", async () => {
+    const capture = vi.fn().mockResolvedValue(captureResult);
+    const handlers = createConsentLogHandlers({ capture });
+    const response = await handlers.POST(
+      request({ "content-type": "application/jsontext" }),
+    );
+
+    expect(response.status).toBe(415);
+    expect(capture).not.toHaveBeenCalled();
+  });
+
+  it("accepts an exactly 32 KiB streamed JSON body", async () => {
+    const capture = vi.fn().mockResolvedValue(captureResult);
+    const handlers = createConsentLogHandlers({ capture });
+    const encoded = new TextEncoder().encode(
+      JSON.stringify({
+        disclosure_version: "v1",
+        affirmative_action: "form_submit",
+        form_url: "https://example.test/signup",
+        email: "person@example.test",
+      }),
+    );
+    const padding = new Uint8Array(MAX_BODY_BYTES - encoded.byteLength).fill(0x20);
+    const response = await handlers.POST(streamedRequest([encoded, padding]));
+
+    expect(response.status).toBe(201);
+    expect(capture).toHaveBeenCalledOnce();
+  });
+
+  it("rejects malformed UTF-8 before parsing JSON", async () => {
+    const capture = vi.fn().mockResolvedValue(captureResult);
+    const handlers = createConsentLogHandlers({ capture });
+    const response = await handlers.POST(
+      streamedRequest([new Uint8Array([0x7b, 0x22, 0xc3, 0x28, 0x22, 0x7d])]),
+    );
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: "invalid_request" });
+    expect(capture).not.toHaveBeenCalled();
+  });
+
+  it("returns a bounded 429 response for exhausted capture buckets", async () => {
+    const handlers = createConsentLogHandlers({
+      capture: vi
+        .fn()
+        .mockRejectedValue(
+          new ConsentCaptureError("rate_limited", { retryAfterSeconds: 17 }),
+        ),
+    });
+    const response = await handlers.POST(request());
+
+    expect(response.status).toBe(429);
+    expect(response.headers.get("retry-after")).toBe("17");
+    expect(response.headers.get("access-control-allow-origin")).toBe(
+      "https://example.test",
+    );
+    expect(await response.json()).toEqual({ error: "rate_limited" });
   });
 });

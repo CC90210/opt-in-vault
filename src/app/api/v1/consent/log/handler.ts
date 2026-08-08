@@ -26,6 +26,63 @@ type TrustedEdgeResolver = {
     | undefined;
 };
 
+class ConsentBodyReadError extends Error {
+  readonly status: 400 | 413;
+
+  constructor(status: 400 | 413, cause?: unknown) {
+    super(status === 413 ? "Consent request body is too large." : "Consent request body is invalid.", {
+      cause,
+    });
+    this.name = "ConsentBodyReadError";
+    this.status = status;
+  }
+}
+
+function declaredBodyLength(request: Request): number | null {
+  const raw = request.headers.get("content-length");
+  if (raw === null) return null;
+  if (!/^(0|[1-9][0-9]*)$/.test(raw)) throw new ConsentBodyReadError(400);
+  const length = Number(raw);
+  if (!Number.isSafeInteger(length)) throw new ConsentBodyReadError(400);
+  if (length > MAX_BODY_BYTES) throw new ConsentBodyReadError(413);
+  return length;
+}
+
+async function readBoundedUtf8Body(request: Request): Promise<string> {
+  declaredBodyLength(request);
+  if (!request.body) return "";
+
+  const reader = request.body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  const chunks: string[] = [];
+  let bytesRead = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value.byteLength > MAX_BODY_BYTES - bytesRead) {
+        let cancelError: unknown;
+        try {
+          await reader.cancel("consent_body_too_large");
+        } catch (error) {
+          cancelError = error;
+        }
+        throw new ConsentBodyReadError(413, cancelError);
+      }
+      bytesRead += value.byteLength;
+      chunks.push(decoder.decode(value, { stream: true }));
+    }
+    chunks.push(decoder.decode());
+    return chunks.join("");
+  } catch (error) {
+    if (error instanceof ConsentBodyReadError) throw error;
+    throw new ConsentBodyReadError(400, error);
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 function json(body: unknown, status: number, origin?: string): Response {
   return Response.json(body, {
     status,
@@ -58,6 +115,7 @@ const statusForError: Record<ConsentCaptureErrorCode, number> = {
   origin_not_allowed: 403,
   form_url_mismatch: 422,
   disclosure_mismatch: 422,
+  rate_limited: 429,
   idempotency_conflict: 409,
   evidence_verification_failed: 503,
 };
@@ -68,13 +126,10 @@ export function createConsentLogHandlers(
 ) {
   return {
     async POST(request: Request): Promise<Response> {
-      const contentType = request.headers.get("content-type")?.toLowerCase() ?? "";
-      if (!contentType.startsWith("application/json")) {
+      const contentType = request.headers.get("content-type") ?? "";
+      const mediaType = contentType.split(";", 1)[0]?.trim().toLowerCase();
+      if (mediaType !== "application/json") {
         return json({ error: "invalid_request" }, 415);
-      }
-      const contentLength = Number(request.headers.get("content-length") ?? "0");
-      if (Number.isFinite(contentLength) && contentLength > MAX_BODY_BYTES) {
-        return json({ error: "invalid_request" }, 413);
       }
       const siteKey = captureCredential(request);
       const origin = request.headers.get("origin") ?? "";
@@ -85,10 +140,7 @@ export function createConsentLogHandlers(
 
       let body: unknown;
       try {
-        const rawBody = await request.text();
-        if (Buffer.byteLength(rawBody, "utf8") > MAX_BODY_BYTES) {
-          return json({ error: "invalid_request" }, 413);
-        }
+        const rawBody = await readBoundedUtf8Body(request);
         body = JSON.parse(rawBody) as unknown;
         if (
           body &&
@@ -98,7 +150,10 @@ export function createConsentLogHandlers(
         ) {
           return json({ error: "invalid_request" }, 400);
         }
-      } catch {
+      } catch (error) {
+        if (error instanceof ConsentBodyReadError) {
+          return json({ error: "invalid_request" }, error.status);
+        }
         return json({ error: "invalid_request" }, 400);
       }
 
@@ -129,7 +184,19 @@ export function createConsentLogHandlers(
         );
       } catch (error) {
         if (error instanceof ConsentCaptureError) {
-          return json({ error: error.code }, statusForError[error.code]);
+          const response = json(
+            { error: error.code },
+            statusForError[error.code],
+            error.code === "rate_limited" ? origin : undefined,
+          );
+          if (
+            error.code === "rate_limited" &&
+            Number.isSafeInteger(error.retryAfterSeconds) &&
+            error.retryAfterSeconds! > 0
+          ) {
+            response.headers.set("retry-after", String(error.retryAfterSeconds));
+          }
+          return response;
         }
         throw error;
       }

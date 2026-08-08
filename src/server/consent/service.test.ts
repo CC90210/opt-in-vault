@@ -73,7 +73,11 @@ describe("consent capture service", () => {
 
   afterEach(() => client.close());
 
-  function service() {
+  function service(captureRateLimit?: {
+    maxRequests: number;
+    replayMaxRequests: number;
+    windowMs: number;
+  }) {
     return createConsentService(createLibsqlConsentRepository(client), {
       siteKeyPepper: SITE_PEPPER,
       subjectHashKey: SUBJECT_KEY,
@@ -82,6 +86,7 @@ describe("consent capture service", () => {
       payloadEncryptionKey: ENCRYPTION_KEY,
       payloadKeyVersion: 3,
       retentionMs: RETENTION_MS,
+      captureRateLimit,
       now: () => now,
       createId: (kind) => `${kind}-${randomUUID()}`,
     });
@@ -315,5 +320,282 @@ describe("consent capture service", () => {
         args: [result.consentId],
       }),
     ).rejects.toThrow(/immutable/i);
+  });
+
+  it("enforces the fixed-window boundary and resets only in the next window", async () => {
+    const capture = service({
+      maxRequests: 2,
+      replayMaxRequests: 2,
+      windowMs: 1_000,
+    });
+    for (const idempotencyKey of ["idem-rate-boundary-01", "idem-rate-boundary-02"]) {
+      await expect(
+        capture.capture(body, {
+          siteKey: SITE_KEY,
+          origin: "https://example.test",
+          idempotencyKey,
+        }),
+      ).resolves.toMatchObject({ created: true });
+    }
+
+    await expect(
+      capture.capture(body, {
+        siteKey: SITE_KEY,
+        origin: "https://example.test",
+        idempotencyKey: "idem-rate-boundary-03",
+      }),
+    ).rejects.toMatchObject({ code: "rate_limited", retryAfterSeconds: 1 });
+
+    now += 1_000;
+    await expect(
+      capture.capture(body, {
+        siteKey: SITE_KEY,
+        origin: "https://example.test",
+        idempotencyKey: "idem-rate-boundary-03",
+      }),
+    ).resolves.toMatchObject({ created: true });
+
+    const buckets = await client.execute({
+      sql: `SELECT window_started_at, count FROM rate_limit_buckets
+            WHERE tenant_id = ? AND scope = 'public_consent_capture'
+            ORDER BY window_started_at`,
+      args: [tenantId],
+    });
+    expect(buckets.rows.map((row) => Number(row.count))).toEqual([2, 1]);
+  });
+
+  it("preserves bounded completed idempotent retries outside the site allowance", async () => {
+    const capture = service({
+      maxRequests: 1,
+      replayMaxRequests: 2,
+      windowMs: 60_000,
+    });
+    const context = {
+      siteKey: SITE_KEY,
+      origin: "https://example.test",
+      idempotencyKey: "idem-rate-replay-01",
+    };
+    const original = await capture.capture(body, context);
+    const firstReplay = await capture.capture(body, context);
+    const secondReplay = await capture.capture(body, context);
+
+    expect(firstReplay).toEqual({ ...original, created: false });
+    expect(secondReplay).toEqual({ ...original, created: false });
+    await expect(capture.capture(body, context)).rejects.toMatchObject({
+      code: "rate_limited",
+    });
+    await expect(
+      capture.capture(body, {
+        ...context,
+        idempotencyKey: "idem-rate-new-0001",
+      }),
+    ).rejects.toMatchObject({ code: "rate_limited" });
+
+    const buckets = await client.execute({
+      sql: `SELECT scope, count FROM rate_limit_buckets
+            WHERE tenant_id = ? ORDER BY scope`,
+      args: [tenantId],
+    });
+    expect(buckets.rows).toEqual([
+      expect.objectContaining({ scope: "public_consent_capture", count: 1 }),
+      expect.objectContaining({ scope: "public_consent_replay", count: 2 }),
+    ]);
+  });
+
+  it("atomically caps concurrent libSQL bucket consumption", async () => {
+    const repository = createLibsqlConsentRepository(client);
+    const decisions = await Promise.all(
+      Array.from({ length: 12 }, (_, index) =>
+        repository.consumeCaptureRateLimit({
+          tenantId,
+          idempotencyKey: `idem-atomic-${String(index).padStart(4, "0")}`,
+          captureBucketKeyHash: "a".repeat(64),
+          replayBucketKeyHash: "b".repeat(64),
+          windowStartedAt: NOW,
+          expiresAt: NOW + 60_000,
+          maxRequests: 3,
+          replayMaxRequests: 2,
+        }),
+      ),
+    );
+
+    expect(decisions.filter((decision) => decision.allowed)).toHaveLength(3);
+    expect(decisions.filter((decision) => !decision.allowed)).toHaveLength(9);
+    const bucket = await client.execute({
+      sql: `SELECT count FROM rate_limit_buckets
+            WHERE tenant_id = ? AND scope = 'public_consent_capture'
+              AND bucket_key_hash = ?`,
+      args: [tenantId, "a".repeat(64)],
+    });
+    expect(bucket.rows).toEqual([expect.objectContaining({ count: 3 })]);
+  });
+
+  it("gives each capture site an independent tenant-scoped allowance", async () => {
+    const secondSiteId = `site-${randomUUID()}`;
+    const secondSiteKey = `oiv_pk_${"d".repeat(43)}`;
+    await client.execute({
+      sql: `INSERT INTO capture_sites
+        (id, tenant_id, name, public_key_prefix, public_key_hash,
+         allowed_origins_json, form_url_pattern, disclosure_version,
+         disclosure_text, controller, purpose, channels_json, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
+      args: [
+        secondSiteId,
+        tenantId,
+        "Second site",
+        secondSiteKey.slice(0, 18),
+        hashCaptureSiteKey(secondSiteKey, SITE_PEPPER),
+        JSON.stringify(["https://example.test"]),
+        "https://example.test/signup*",
+        "disclosure-2026-08",
+        "I agree to receive product updates by email.",
+        "Example Controller Inc.",
+        "Product updates",
+        JSON.stringify(["email"]),
+      ],
+    });
+    const capture = service({
+      maxRequests: 1,
+      replayMaxRequests: 1,
+      windowMs: 60_000,
+    });
+    await capture.capture(body, {
+      siteKey: SITE_KEY,
+      origin: "https://example.test",
+      idempotencyKey: "idem-site-one-0001",
+    });
+    await expect(
+      capture.capture(body, {
+        siteKey: SITE_KEY,
+        origin: "https://example.test",
+        idempotencyKey: "idem-site-one-0002",
+      }),
+    ).rejects.toMatchObject({ code: "rate_limited" });
+    await expect(
+      capture.capture(body, {
+        siteKey: secondSiteKey,
+        origin: "https://example.test",
+        idempotencyKey: "idem-site-two-0001",
+      }),
+    ).resolves.toMatchObject({ captureSiteId: secondSiteId, created: true });
+
+    const buckets = await client.execute({
+      sql: `SELECT bucket_key_hash, count FROM rate_limit_buckets
+            WHERE tenant_id = ? AND scope = 'public_consent_capture'`,
+      args: [tenantId],
+    });
+    expect(buckets.rows).toHaveLength(2);
+    expect(new Set(buckets.rows.map((row) => String(row.bucket_key_hash))).size).toBe(2);
+    expect(buckets.rows.every((row) => Number(row.count) === 1)).toBe(true);
+  });
+
+  it("isolates capture quotas by tenant and stores only HMAC bucket keys", async () => {
+    const secondTenantId = `tenant-${randomUUID()}`;
+    const secondSiteId = `site-${randomUUID()}`;
+    const secondSiteKey = `oiv_pk_${"c".repeat(43)}`;
+    await client.batch(
+      [
+        {
+          sql: "INSERT INTO tenants (id, slug, name) VALUES (?, ?, ?)",
+          args: [secondTenantId, secondTenantId, "Second Controller"],
+        },
+        {
+          sql: `INSERT INTO capture_sites
+            (id, tenant_id, name, public_key_prefix, public_key_hash,
+             allowed_origins_json, form_url_pattern, disclosure_version,
+             disclosure_text, controller, purpose, channels_json, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
+          args: [
+            secondSiteId,
+            secondTenantId,
+            "Second signup",
+            secondSiteKey.slice(0, 18),
+            hashCaptureSiteKey(secondSiteKey, SITE_PEPPER),
+            JSON.stringify(["https://example.test"]),
+            "https://example.test/signup*",
+            "disclosure-2026-08",
+            "I agree to receive product updates by email.",
+            "Second Controller Inc.",
+            "Product updates",
+            JSON.stringify(["email"]),
+          ],
+        },
+      ],
+      "write",
+    );
+    const capture = service({
+      maxRequests: 1,
+      replayMaxRequests: 1,
+      windowMs: 60_000,
+    });
+    await capture.capture(body, {
+      siteKey: SITE_KEY,
+      origin: "https://example.test",
+      idempotencyKey: "idem-tenant-one-01",
+    });
+    await capture.capture(body, {
+      siteKey: secondSiteKey,
+      origin: "https://example.test",
+      idempotencyKey: "idem-tenant-two-01",
+    });
+    await expect(
+      capture.capture(body, {
+        siteKey: SITE_KEY,
+        origin: "https://example.test",
+        idempotencyKey: "idem-tenant-one-02",
+      }),
+    ).rejects.toMatchObject({ code: "rate_limited" });
+
+    const buckets = await client.execute(
+      `SELECT tenant_id, bucket_key_hash, count FROM rate_limit_buckets
+       WHERE scope = 'public_consent_capture' ORDER BY tenant_id`,
+    );
+    expect(buckets.rows).toHaveLength(2);
+    expect(new Set(buckets.rows.map((row) => String(row.tenant_id)))).toEqual(
+      new Set([tenantId, secondTenantId]),
+    );
+    for (const row of buckets.rows) {
+      const hash = String(row.bucket_key_hash);
+      expect(hash).toMatch(/^[a-f0-9]{64}$/);
+      expect(hash).not.toContain(siteId);
+      expect(hash).not.toContain(secondSiteId);
+      expect(hash).not.toContain("person@example.test");
+      expect(Number(row.count)).toBe(1);
+    }
+  });
+
+  it("fails closed before persistence when the durable limiter is unavailable", async () => {
+    const repository = createLibsqlConsentRepository(client);
+    const persistOrGet = vi.fn(repository.persistOrGet.bind(repository));
+    const capture = createConsentService(
+      {
+        ...repository,
+        consumeCaptureRateLimit: vi
+          .fn()
+          .mockRejectedValue(new Error("rate-limit database unavailable")),
+        persistOrGet,
+      },
+      {
+        siteKeyPepper: SITE_PEPPER,
+        subjectHashKey: SUBJECT_KEY,
+        signatureKey: SIGNATURE_KEY,
+        signatureKeyVersion: 4,
+        payloadEncryptionKey: ENCRYPTION_KEY,
+        payloadKeyVersion: 3,
+        retentionMs: RETENTION_MS,
+        now: () => now,
+      },
+    );
+
+    await expect(
+      capture.capture(body, {
+        siteKey: SITE_KEY,
+        origin: "https://example.test",
+        idempotencyKey: "idem-rate-fail-closed",
+      }),
+    ).rejects.toThrow("rate-limit database unavailable");
+    expect(persistOrGet).not.toHaveBeenCalled();
+    const stored = await client.execute("SELECT count(*) AS count FROM consent_logs");
+    expect(Number(stored.rows[0].count)).toBe(0);
   });
 });

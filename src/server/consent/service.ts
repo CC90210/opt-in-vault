@@ -22,6 +22,23 @@ const ACTION_PATTERN = /^[a-z][a-z0-9_-]{1,63}$/;
 const SOURCE_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
 const SECRET_MIN_BYTES = 32;
 const MAX_CLOCK_SKEW_MS = 5 * 60 * 1_000;
+const RATE_LIMIT_HASH_PATTERN = /^[a-f0-9]{64}$/;
+const RATE_LIMIT_SCOPE_CAPTURE = "public_consent_capture";
+const RATE_LIMIT_SCOPE_REPLAY = "public_consent_replay";
+const MIN_RATE_LIMIT_WINDOW_MS = 1_000;
+const MAX_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1_000;
+const MAX_RATE_LIMIT_REQUESTS = 10_000;
+const MAX_RATE_LIMIT_KEY_PART_LENGTH = 256;
+
+/**
+ * Fixed-window public ingress contract. Callers may tighten these values through
+ * createConsentService options, within the validation bounds above.
+ */
+export const CONSENT_CAPTURE_RATE_LIMIT_DEFAULTS = Object.freeze({
+  maxRequests: 120,
+  replayMaxRequests: 10,
+  windowMs: 60_000,
+});
 
 const captureInputSchema = z
   .object({
@@ -60,16 +77,22 @@ export type ConsentCaptureErrorCode =
   | "origin_not_allowed"
   | "form_url_mismatch"
   | "disclosure_mismatch"
+  | "rate_limited"
   | "idempotency_conflict"
   | "evidence_verification_failed";
 
 export class ConsentCaptureError extends Error {
   readonly code: ConsentCaptureErrorCode;
+  readonly retryAfterSeconds?: number;
 
-  constructor(code: ConsentCaptureErrorCode) {
+  constructor(
+    code: ConsentCaptureErrorCode,
+    options: { retryAfterSeconds?: number } = {},
+  ) {
     super(code);
     this.name = "ConsentCaptureError";
     this.code = code;
+    this.retryAfterSeconds = options.retryAfterSeconds;
   }
 }
 
@@ -110,8 +133,27 @@ type NewConsentEvidence = StoredConsentEvidence & {
   occurredAt: number;
 };
 
+type CaptureRateLimitInput = {
+  tenantId: string;
+  idempotencyKey: string;
+  captureBucketKeyHash: string;
+  replayBucketKeyHash: string;
+  windowStartedAt: number;
+  expiresAt: number;
+  maxRequests: number;
+  replayMaxRequests: number;
+};
+
+type CaptureRateLimitDecision = {
+  allowed: boolean;
+  replay: boolean;
+};
+
 export type ConsentRepository = {
   findCaptureSite(prefix: string, keyHash: string): Promise<CaptureSiteRecord | null>;
+  consumeCaptureRateLimit(
+    input: CaptureRateLimitInput,
+  ): Promise<CaptureRateLimitDecision>;
   persistOrGet(evidence: NewConsentEvidence): Promise<{
     evidence: StoredConsentEvidence;
     created: boolean;
@@ -141,6 +183,11 @@ type ConsentServiceOptions = {
   retentionMs: number;
   signatureVerificationKeys?: Readonly<Record<number, string>>;
   payloadDecryptionKeys?: Readonly<Record<number, Buffer>>;
+  captureRateLimit?: {
+    maxRequests: number;
+    replayMaxRequests: number;
+    windowMs: number;
+  };
   now?: () => number;
   createId?: (kind: "consent" | "certificate") => string;
 };
@@ -254,6 +301,81 @@ function validateOptions(options: ConsentServiceOptions): void {
   if (!Number.isSafeInteger(options.retentionMs) || options.retentionMs <= 0) {
     throw new Error("Consent retention must be an explicit positive duration.");
   }
+  const rateLimit = options.captureRateLimit ?? CONSENT_CAPTURE_RATE_LIMIT_DEFAULTS;
+  if (
+    !Number.isSafeInteger(rateLimit.maxRequests) ||
+    rateLimit.maxRequests < 1 ||
+    rateLimit.maxRequests > MAX_RATE_LIMIT_REQUESTS
+  ) {
+    throw new Error("Consent capture rate-limit maximum is invalid.");
+  }
+  if (
+    !Number.isSafeInteger(rateLimit.replayMaxRequests) ||
+    rateLimit.replayMaxRequests < 1 ||
+    rateLimit.replayMaxRequests > MAX_RATE_LIMIT_REQUESTS
+  ) {
+    throw new Error("Consent replay rate-limit maximum is invalid.");
+  }
+  if (
+    !Number.isSafeInteger(rateLimit.windowMs) ||
+    rateLimit.windowMs < MIN_RATE_LIMIT_WINDOW_MS ||
+    rateLimit.windowMs > MAX_RATE_LIMIT_WINDOW_MS
+  ) {
+    throw new Error("Consent capture rate-limit window is invalid.");
+  }
+}
+
+function rateLimitKeyHash(
+  kind: "capture" | "replay",
+  tenantId: string,
+  captureSiteId: string,
+  idempotencyKey: string,
+  secret: string,
+): string {
+  for (const value of [tenantId, captureSiteId]) {
+    if (
+      value.length < 1 ||
+      value.length > MAX_RATE_LIMIT_KEY_PART_LENGTH ||
+      /[\u0000-\u001f\u007f]/.test(value)
+    ) {
+      throw new ConsentCaptureError("site_configuration_invalid");
+    }
+  }
+  return createHmac("sha256", secret)
+    .update(
+      canonicalizeJson({
+        version: 1,
+        kind,
+        tenant_id: tenantId,
+        capture_site_id: captureSiteId,
+        ...(kind === "replay" ? { idempotency_key: idempotencyKey } : {}),
+      }),
+      "utf8",
+    )
+    .digest("hex");
+}
+
+function validateRateLimitInput(input: CaptureRateLimitInput): void {
+  if (
+    input.tenantId.length < 1 ||
+    input.tenantId.length > MAX_RATE_LIMIT_KEY_PART_LENGTH ||
+    !IDEMPOTENCY_PATTERN.test(input.idempotencyKey) ||
+    !RATE_LIMIT_HASH_PATTERN.test(input.captureBucketKeyHash) ||
+    !RATE_LIMIT_HASH_PATTERN.test(input.replayBucketKeyHash) ||
+    !Number.isSafeInteger(input.windowStartedAt) ||
+    input.windowStartedAt < 0 ||
+    !Number.isSafeInteger(input.expiresAt) ||
+    input.expiresAt <= input.windowStartedAt ||
+    input.expiresAt - input.windowStartedAt > MAX_RATE_LIMIT_WINDOW_MS ||
+    !Number.isSafeInteger(input.maxRequests) ||
+    input.maxRequests < 1 ||
+    input.maxRequests > MAX_RATE_LIMIT_REQUESTS ||
+    !Number.isSafeInteger(input.replayMaxRequests) ||
+    input.replayMaxRequests < 1 ||
+    input.replayMaxRequests > MAX_RATE_LIMIT_REQUESTS
+  ) {
+    throw new Error("Consent capture rate-limit input is invalid.");
+  }
 }
 
 function rowBuffer(value: unknown): Buffer {
@@ -340,6 +462,66 @@ export function createLibsqlConsentRepository(client: Client): ConsentRepository
       };
     },
 
+    async consumeCaptureRateLimit(input) {
+      validateRateLimitInput(input);
+      const result = await client.execute({
+        sql: `WITH request_mode AS (
+                SELECT CASE WHEN EXISTS (
+                  SELECT 1 FROM consent_logs
+                  WHERE tenant_id = ? AND idempotency_key = ?
+                ) THEN 1 ELSE 0 END AS is_replay
+              )
+              INSERT INTO rate_limit_buckets
+                (id, tenant_id, scope, bucket_key_hash,
+                 window_started_at, count, expires_at)
+              SELECT ?, ?,
+                     CASE WHEN is_replay = 1 THEN ? ELSE ? END,
+                     CASE WHEN is_replay = 1 THEN ? ELSE ? END,
+                     ?, 1, ?
+              FROM request_mode
+              WHERE true
+              ON CONFLICT (tenant_id, scope, bucket_key_hash, window_started_at)
+              DO UPDATE SET count = rate_limit_buckets.count + 1
+              WHERE rate_limit_buckets.count <
+                CASE WHEN rate_limit_buckets.scope = ? THEN ? ELSE ? END
+              RETURNING scope, count`,
+        args: [
+          input.tenantId,
+          input.idempotencyKey,
+          `rate-limit-${randomUUID()}`,
+          input.tenantId,
+          RATE_LIMIT_SCOPE_REPLAY,
+          RATE_LIMIT_SCOPE_CAPTURE,
+          input.replayBucketKeyHash,
+          input.captureBucketKeyHash,
+          input.windowStartedAt,
+          input.expiresAt,
+          RATE_LIMIT_SCOPE_REPLAY,
+          input.replayMaxRequests,
+          input.maxRequests,
+        ],
+      });
+      if (result.rows.length === 0) {
+        return { allowed: false, replay: false };
+      }
+      if (result.rows.length !== 1) {
+        throw new Error("Consent capture rate-limit result is invalid.");
+      }
+      const scope = String(result.rows[0].scope);
+      const count = Number(result.rows[0].count);
+      const replay = scope === RATE_LIMIT_SCOPE_REPLAY;
+      const limit = replay ? input.replayMaxRequests : input.maxRequests;
+      if (
+        (!replay && scope !== RATE_LIMIT_SCOPE_CAPTURE) ||
+        !Number.isSafeInteger(count) ||
+        count < 1 ||
+        count > limit
+      ) {
+        throw new Error("Consent capture rate-limit result is invalid.");
+      }
+      return { allowed: true, replay };
+    },
+
     async persistOrGet(evidence) {
       const results = await client.batch(
         [
@@ -406,6 +588,9 @@ export function createConsentService(
   validateOptions(options);
   const now = options.now ?? Date.now;
   const createId = options.createId ?? ((kind) => `${kind}_${randomUUID()}`);
+  const captureRateLimit = {
+    ...(options.captureRateLimit ?? CONSENT_CAPTURE_RATE_LIMIT_DEFAULTS),
+  };
 
   return {
     async capture(
@@ -456,6 +641,49 @@ export function createConsentService(
       const retentionExpiresAt = receivedAt + options.retentionMs;
       if (!Number.isSafeInteger(retentionExpiresAt) || retentionExpiresAt <= receivedAt) {
         throw new Error("Consent retention deadline is invalid.");
+      }
+      const windowStartedAt =
+        Math.floor(receivedAt / captureRateLimit.windowMs) * captureRateLimit.windowMs;
+      const rateLimitExpiresAt = windowStartedAt + captureRateLimit.windowMs;
+      if (!Number.isSafeInteger(rateLimitExpiresAt) || rateLimitExpiresAt <= receivedAt) {
+        throw new Error("Consent capture rate-limit window is invalid.");
+      }
+      const rateLimit = await repository.consumeCaptureRateLimit({
+        tenantId: site.tenantId,
+        idempotencyKey: context.idempotencyKey,
+        captureBucketKeyHash: rateLimitKeyHash(
+          "capture",
+          site.tenantId,
+          site.id,
+          context.idempotencyKey,
+          options.siteKeyPepper,
+        ),
+        replayBucketKeyHash: rateLimitKeyHash(
+          "replay",
+          site.tenantId,
+          site.id,
+          context.idempotencyKey,
+          options.siteKeyPepper,
+        ),
+        windowStartedAt,
+        expiresAt: rateLimitExpiresAt,
+        maxRequests: captureRateLimit.maxRequests,
+        replayMaxRequests: captureRateLimit.replayMaxRequests,
+      });
+      if (
+        !rateLimit ||
+        typeof rateLimit.allowed !== "boolean" ||
+        typeof rateLimit.replay !== "boolean"
+      ) {
+        throw new Error("Consent capture rate-limit decision is invalid.");
+      }
+      if (!rateLimit.allowed) {
+        throw new ConsentCaptureError("rate_limited", {
+          retryAfterSeconds: Math.max(
+            1,
+            Math.ceil((rateLimitExpiresAt - receivedAt) / 1_000),
+          ),
+        });
       }
       const occurredAt = requestTimestamp(parsed.data.occurred_at, receivedAt);
       const subject = {
