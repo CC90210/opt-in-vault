@@ -6,6 +6,7 @@ import type {
   ConsentCaptureErrorCode,
 } from "@/server/consent/service";
 import { ConsentCaptureError } from "@/server/consent/service";
+import { isPublicIpAddress } from "@/server/security/network";
 
 const MAX_BODY_BYTES = 32 * 1_024;
 
@@ -25,6 +26,36 @@ type TrustedEdgeResolver = {
     | { ip: string; source: string }
     | undefined;
 };
+
+type TrustedEdgeEnvironment = {
+  [name: string]: string | undefined;
+  CONSENT_TRUSTED_EDGE_PROVIDER?: string;
+  VERCEL?: string;
+};
+
+export function createConfiguredTrustedEdgeResolver(
+  environment: TrustedEdgeEnvironment = process.env,
+): TrustedEdgeResolver {
+  if (environment.CONSENT_TRUSTED_EDGE_PROVIDER !== "vercel") {
+    throw new Error(
+      "CONSENT_TRUSTED_EDGE_PROVIDER=vercel is required for public consent capture.",
+    );
+  }
+  if (environment.VERCEL !== "1") {
+    throw new Error(
+      "The Vercel trusted-edge provider can only run directly on Vercel.",
+    );
+  }
+  return {
+    getClientIp(request) {
+      const raw = request.headers.get("x-vercel-forwarded-for")?.trim();
+      if (!raw || raw.length > 64 || raw.includes(",") || !isPublicIpAddress(raw)) {
+        return undefined;
+      }
+      return { ip: raw, source: "vercel" };
+    },
+  };
+}
 
 class ConsentBodyReadError extends Error {
   readonly status: 400 | 413;
@@ -115,6 +146,7 @@ const statusForError: Record<ConsentCaptureErrorCode, number> = {
   origin_not_allowed: 403,
   form_url_mismatch: 422,
   disclosure_mismatch: 422,
+  source_unavailable: 503,
   rate_limited: 429,
   idempotency_conflict: 409,
   evidence_verification_failed: 503,
@@ -258,9 +290,12 @@ async function productionHandlers() {
       ),
       payloadKeyVersion: positiveIntegerEnv("CONSENT_PAYLOAD_KEY_VERSION"),
       retentionMs: retentionDays * 24 * 60 * 60 * 1_000,
+      requireTrustedSource: true,
     },
   );
-  return createConsentLogHandlers(service);
+  return createConsentLogHandlers(service, {
+    trustedEdge: createConfiguredTrustedEdgeResolver(),
+  });
 }
 
 export async function POST(request: Request): Promise<Response> {

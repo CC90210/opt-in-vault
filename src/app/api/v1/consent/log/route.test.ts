@@ -2,7 +2,10 @@ import { describe, expect, it, vi } from "vitest";
 
 import { ConsentCaptureError, type ConsentCaptureResult } from "@/server/consent/service";
 
-import { createConsentLogHandlers } from "./handler";
+import {
+  createConfiguredTrustedEdgeResolver,
+  createConsentLogHandlers,
+} from "./handler";
 
 const SITE_KEY = `oiv_pk_${"b".repeat(43)}`;
 const MAX_BODY_BYTES = 32 * 1_024;
@@ -120,10 +123,49 @@ describe("POST /api/v1/consent/log", () => {
     });
   });
 
+  it("trusts only a single public direct-Vercel source header when explicitly configured", async () => {
+    expect(() => createConfiguredTrustedEdgeResolver({ VERCEL: "1" })).toThrow(
+      /CONSENT_TRUSTED_EDGE_PROVIDER=vercel/,
+    );
+    expect(() =>
+      createConfiguredTrustedEdgeResolver({
+        CONSENT_TRUSTED_EDGE_PROVIDER: "vercel",
+        VERCEL: "0",
+      }),
+    ).toThrow(/directly on Vercel/);
+
+    const resolver = createConfiguredTrustedEdgeResolver({
+      CONSENT_TRUSTED_EDGE_PROVIDER: "vercel",
+      VERCEL: "1",
+    });
+    expect(
+      await resolver.getClientIp(
+        request({
+          "x-forwarded-for": "1.1.1.1",
+          "x-vercel-forwarded-for": "8.8.8.8",
+        }),
+      ),
+    ).toEqual({ ip: "8.8.8.8", source: "vercel" });
+    expect(
+      await resolver.getClientIp(request({ "x-forwarded-for": "8.8.8.8" })),
+    ).toBeUndefined();
+    expect(
+      await resolver.getClientIp(
+        request({ "x-vercel-forwarded-for": "8.8.8.8, 1.1.1.1" }),
+      ),
+    ).toBeUndefined();
+    expect(
+      await resolver.getClientIp(
+        request({ "x-vercel-forwarded-for": "127.0.0.1" }),
+      ),
+    ).toBeUndefined();
+  });
+
   it("maps validation/auth/conflict failures without leaking details and disables caching", async () => {
     const cases = [
       ["site_not_found", 401],
       ["origin_not_allowed", 403],
+      ["source_unavailable", 503],
       ["idempotency_conflict", 409],
     ] as const;
 

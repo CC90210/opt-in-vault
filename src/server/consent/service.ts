@@ -7,6 +7,7 @@ import type { Client } from "@libsql/client";
 import { z } from "zod";
 
 import { decryptSecret, encryptSecret } from "@/server/security/encryption";
+import { isPublicIpAddress } from "@/server/security/network";
 import { emailSchema, webUrlSchema } from "@/server/validation/primitives";
 
 import {
@@ -24,6 +25,7 @@ const SECRET_MIN_BYTES = 32;
 const MAX_CLOCK_SKEW_MS = 5 * 60 * 1_000;
 const RATE_LIMIT_HASH_PATTERN = /^[a-f0-9]{64}$/;
 const RATE_LIMIT_SCOPE_CAPTURE = "public_consent_capture";
+const RATE_LIMIT_SCOPE_SOURCE = "public_consent_source";
 const RATE_LIMIT_SCOPE_REPLAY = "public_consent_replay";
 const MIN_RATE_LIMIT_WINDOW_MS = 1_000;
 const MAX_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1_000;
@@ -36,6 +38,7 @@ const MAX_RATE_LIMIT_KEY_PART_LENGTH = 256;
  */
 export const CONSENT_CAPTURE_RATE_LIMIT_DEFAULTS = Object.freeze({
   maxRequests: 120,
+  sourceMaxRequests: 25,
   replayMaxRequests: 10,
   windowMs: 60_000,
 });
@@ -77,6 +80,7 @@ export type ConsentCaptureErrorCode =
   | "origin_not_allowed"
   | "form_url_mismatch"
   | "disclosure_mismatch"
+  | "source_unavailable"
   | "rate_limited"
   | "idempotency_conflict"
   | "evidence_verification_failed";
@@ -137,10 +141,12 @@ type CaptureRateLimitInput = {
   tenantId: string;
   idempotencyKey: string;
   captureBucketKeyHash: string;
+  sourceBucketKeyHash: string;
   replayBucketKeyHash: string;
   windowStartedAt: number;
   expiresAt: number;
   maxRequests: number;
+  sourceMaxRequests: number;
   replayMaxRequests: number;
 };
 
@@ -185,9 +191,11 @@ type ConsentServiceOptions = {
   payloadDecryptionKeys?: Readonly<Record<number, Buffer>>;
   captureRateLimit?: {
     maxRequests: number;
+    sourceMaxRequests: number;
     replayMaxRequests: number;
     windowMs: number;
   };
+  requireTrustedSource?: boolean;
   now?: () => number;
   createId?: (kind: "consent" | "certificate") => string;
 };
@@ -310,6 +318,13 @@ function validateOptions(options: ConsentServiceOptions): void {
     throw new Error("Consent capture rate-limit maximum is invalid.");
   }
   if (
+    !Number.isSafeInteger(rateLimit.sourceMaxRequests) ||
+    rateLimit.sourceMaxRequests < 1 ||
+    rateLimit.sourceMaxRequests > MAX_RATE_LIMIT_REQUESTS
+  ) {
+    throw new Error("Consent source rate-limit maximum is invalid.");
+  }
+  if (
     !Number.isSafeInteger(rateLimit.replayMaxRequests) ||
     rateLimit.replayMaxRequests < 1 ||
     rateLimit.replayMaxRequests > MAX_RATE_LIMIT_REQUESTS
@@ -326,10 +341,10 @@ function validateOptions(options: ConsentServiceOptions): void {
 }
 
 function rateLimitKeyHash(
-  kind: "capture" | "replay",
+  kind: "capture" | "source" | "replay",
   tenantId: string,
   captureSiteId: string,
-  idempotencyKey: string,
+  keyMaterial: string,
   secret: string,
 ): string {
   for (const value of [tenantId, captureSiteId]) {
@@ -348,7 +363,8 @@ function rateLimitKeyHash(
         kind,
         tenant_id: tenantId,
         capture_site_id: captureSiteId,
-        ...(kind === "replay" ? { idempotency_key: idempotencyKey } : {}),
+        ...(kind === "source" ? { source_identity: keyMaterial } : {}),
+        ...(kind === "replay" ? { idempotency_key: keyMaterial } : {}),
       }),
       "utf8",
     )
@@ -361,6 +377,7 @@ function validateRateLimitInput(input: CaptureRateLimitInput): void {
     input.tenantId.length > MAX_RATE_LIMIT_KEY_PART_LENGTH ||
     !IDEMPOTENCY_PATTERN.test(input.idempotencyKey) ||
     !RATE_LIMIT_HASH_PATTERN.test(input.captureBucketKeyHash) ||
+    !RATE_LIMIT_HASH_PATTERN.test(input.sourceBucketKeyHash) ||
     !RATE_LIMIT_HASH_PATTERN.test(input.replayBucketKeyHash) ||
     !Number.isSafeInteger(input.windowStartedAt) ||
     input.windowStartedAt < 0 ||
@@ -370,12 +387,40 @@ function validateRateLimitInput(input: CaptureRateLimitInput): void {
     !Number.isSafeInteger(input.maxRequests) ||
     input.maxRequests < 1 ||
     input.maxRequests > MAX_RATE_LIMIT_REQUESTS ||
+    !Number.isSafeInteger(input.sourceMaxRequests) ||
+    input.sourceMaxRequests < 1 ||
+    input.sourceMaxRequests > MAX_RATE_LIMIT_REQUESTS ||
     !Number.isSafeInteger(input.replayMaxRequests) ||
     input.replayMaxRequests < 1 ||
     input.replayMaxRequests > MAX_RATE_LIMIT_REQUESTS
   ) {
     throw new Error("Consent capture rate-limit input is invalid.");
   }
+}
+
+function normalizedTrustedEdge(
+  evidence: TrustedEdgeEvidence | undefined,
+): TrustedEdgeEvidence | undefined {
+  if (!evidence) return undefined;
+  if (!SOURCE_PATTERN.test(evidence.source) || !isPublicIpAddress(evidence.ip)) {
+    throw new ConsentCaptureError("invalid_request");
+  }
+  const family = isIP(evidence.ip);
+  let ip: string;
+  if (family === 4) {
+    ip = evidence.ip
+      .split(".")
+      .map((part) => String(Number(part)))
+      .join(".");
+  } else {
+    try {
+      const hostname = new URL(`http://[${evidence.ip}]/`).hostname;
+      ip = hostname.slice(1, -1).toLowerCase();
+    } catch {
+      throw new ConsentCaptureError("invalid_request");
+    }
+  }
+  return { ip, source: evidence.source };
 }
 
 function rowBuffer(value: unknown): Buffer {
@@ -438,11 +483,14 @@ export function createLibsqlConsentRepository(client: Client): ConsentRepository
   return {
     async findCaptureSite(prefix, keyHash) {
       const result = await client.execute({
-        sql: `SELECT id, tenant_id, allowed_origins_json, form_url_pattern,
-                     disclosure_version, disclosure_text, controller, purpose,
-                     channels_json, status
-              FROM capture_sites
-              WHERE public_key_prefix = ? AND public_key_hash = ?
+        sql: `SELECT site.id, site.tenant_id, site.allowed_origins_json,
+                     site.form_url_pattern, site.disclosure_version,
+                     site.disclosure_text, site.controller, site.purpose,
+                     site.channels_json, site.status
+              FROM capture_sites AS site
+              JOIN tenants AS tenant ON tenant.id = site.tenant_id
+              WHERE site.public_key_prefix = ? AND site.public_key_hash = ?
+                AND tenant.status = 'active'
               LIMIT 1`,
         args: [prefix, keyHash],
       });
@@ -465,57 +513,126 @@ export function createLibsqlConsentRepository(client: Client): ConsentRepository
     async consumeCaptureRateLimit(input) {
       validateRateLimitInput(input);
       const result = await client.execute({
-        sql: `WITH request_mode AS (
-                SELECT CASE WHEN EXISTS (
-                  SELECT 1 FROM consent_logs
-                  WHERE tenant_id = ? AND idempotency_key = ?
-                ) THEN 1 ELSE 0 END AS is_replay
+        sql: `WITH parameters (
+                tenant_id, idempotency_key, window_started_at, expires_at,
+                replay_id, source_id, capture_id,
+                replay_scope, source_scope, capture_scope,
+                replay_hash, source_hash, capture_hash,
+                replay_max, source_max, capture_max
+              ) AS (VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)),
+              request_mode AS (
+                SELECT parameters.*,
+                       CASE WHEN EXISTS (
+                         SELECT 1 FROM consent_logs
+                         WHERE tenant_id = parameters.tenant_id
+                           AND idempotency_key = parameters.idempotency_key
+                       ) THEN 1 ELSE 0 END AS is_replay
+                FROM parameters
+              ),
+              capacity AS (
+                SELECT request_mode.*
+                FROM request_mode
+                WHERE (
+                  is_replay = 1 AND COALESCE((
+                    SELECT count FROM rate_limit_buckets
+                    WHERE tenant_id = request_mode.tenant_id
+                      AND scope = request_mode.replay_scope
+                      AND bucket_key_hash = request_mode.replay_hash
+                      AND window_started_at = request_mode.window_started_at
+                  ), 0) < request_mode.replay_max
+                  AND COALESCE((
+                    SELECT count FROM rate_limit_buckets
+                    WHERE tenant_id = request_mode.tenant_id
+                      AND scope = request_mode.source_scope
+                      AND bucket_key_hash = request_mode.source_hash
+                      AND window_started_at = request_mode.window_started_at
+                  ), 0) < request_mode.source_max
+                ) OR (
+                  is_replay = 0
+                  AND COALESCE((
+                    SELECT count FROM rate_limit_buckets
+                    WHERE tenant_id = request_mode.tenant_id
+                      AND scope = request_mode.source_scope
+                      AND bucket_key_hash = request_mode.source_hash
+                      AND window_started_at = request_mode.window_started_at
+                  ), 0) < request_mode.source_max
+                  AND COALESCE((
+                    SELECT count FROM rate_limit_buckets
+                    WHERE tenant_id = request_mode.tenant_id
+                      AND scope = request_mode.capture_scope
+                      AND bucket_key_hash = request_mode.capture_hash
+                      AND window_started_at = request_mode.window_started_at
+                  ), 0) < request_mode.capture_max
+                )
+              ),
+              buckets (id, scope, bucket_key_hash) AS (
+                SELECT replay_id, replay_scope, replay_hash
+                FROM capacity WHERE is_replay = 1
+                UNION ALL
+                SELECT source_id, source_scope, source_hash
+                FROM capacity
+                UNION ALL
+                SELECT capture_id, capture_scope, capture_hash
+                FROM capacity WHERE is_replay = 0
               )
               INSERT INTO rate_limit_buckets
                 (id, tenant_id, scope, bucket_key_hash,
                  window_started_at, count, expires_at)
-              SELECT ?, ?,
-                     CASE WHEN is_replay = 1 THEN ? ELSE ? END,
-                     CASE WHEN is_replay = 1 THEN ? ELSE ? END,
-                     ?, 1, ?
-              FROM request_mode
+              SELECT buckets.id, parameters.tenant_id, buckets.scope,
+                     buckets.bucket_key_hash, parameters.window_started_at,
+                     1, parameters.expires_at
+              FROM buckets CROSS JOIN parameters
               WHERE true
               ON CONFLICT (tenant_id, scope, bucket_key_hash, window_started_at)
               DO UPDATE SET count = rate_limit_buckets.count + 1
-              WHERE rate_limit_buckets.count <
-                CASE WHEN rate_limit_buckets.scope = ? THEN ? ELSE ? END
               RETURNING scope, count`,
         args: [
           input.tenantId,
           input.idempotencyKey,
-          `rate-limit-${randomUUID()}`,
-          input.tenantId,
-          RATE_LIMIT_SCOPE_REPLAY,
-          RATE_LIMIT_SCOPE_CAPTURE,
-          input.replayBucketKeyHash,
-          input.captureBucketKeyHash,
           input.windowStartedAt,
           input.expiresAt,
+          `rate-limit-replay-${randomUUID()}`,
+          `rate-limit-source-${randomUUID()}`,
+          `rate-limit-capture-${randomUUID()}`,
           RATE_LIMIT_SCOPE_REPLAY,
+          RATE_LIMIT_SCOPE_SOURCE,
+          RATE_LIMIT_SCOPE_CAPTURE,
+          input.replayBucketKeyHash,
+          input.sourceBucketKeyHash,
+          input.captureBucketKeyHash,
           input.replayMaxRequests,
+          input.sourceMaxRequests,
           input.maxRequests,
         ],
       });
       if (result.rows.length === 0) {
         return { allowed: false, replay: false };
       }
-      if (result.rows.length !== 1) {
-        throw new Error("Consent capture rate-limit result is invalid.");
-      }
-      const scope = String(result.rows[0].scope);
-      const count = Number(result.rows[0].count);
-      const replay = scope === RATE_LIMIT_SCOPE_REPLAY;
-      const limit = replay ? input.replayMaxRequests : input.maxRequests;
+      const counts = new Map(
+        result.rows.map((row) => [String(row.scope), Number(row.count)]),
+      );
+      const replay = counts.has(RATE_LIMIT_SCOPE_REPLAY);
+      const expected = replay
+        ? [
+            [RATE_LIMIT_SCOPE_REPLAY, input.replayMaxRequests] as const,
+            [RATE_LIMIT_SCOPE_SOURCE, input.sourceMaxRequests] as const,
+          ]
+        : [
+            [RATE_LIMIT_SCOPE_SOURCE, input.sourceMaxRequests] as const,
+            [RATE_LIMIT_SCOPE_CAPTURE, input.maxRequests] as const,
+          ];
       if (
-        (!replay && scope !== RATE_LIMIT_SCOPE_CAPTURE) ||
-        !Number.isSafeInteger(count) ||
-        count < 1 ||
-        count > limit
+        result.rows.length !== expected.length ||
+        counts.size !== expected.length ||
+        expected.some(([scope, limit]) => {
+          const count = counts.get(scope);
+          return (
+            !Number.isSafeInteger(count) ||
+            count === undefined ||
+            count < 1 ||
+            count > limit
+          );
+        })
       ) {
         throw new Error("Consent capture rate-limit result is invalid.");
       }
@@ -591,6 +708,7 @@ export function createConsentService(
   const captureRateLimit = {
     ...(options.captureRateLimit ?? CONSENT_CAPTURE_RATE_LIMIT_DEFAULTS),
   };
+  const requireTrustedSource = options.requireTrustedSource ?? true;
 
   return {
     async capture(
@@ -608,11 +726,9 @@ export function createConsentService(
       ) {
         throw new ConsentCaptureError("invalid_request");
       }
-      if (
-        context.trustedEdge &&
-        (!isIP(context.trustedEdge.ip) || !SOURCE_PATTERN.test(context.trustedEdge.source))
-      ) {
-        throw new ConsentCaptureError("invalid_request");
+      const trustedEdge = normalizedTrustedEdge(context.trustedEdge);
+      if (requireTrustedSource && !trustedEdge) {
+        throw new ConsentCaptureError("source_unavailable");
       }
 
       let keyHash: string;
@@ -655,7 +771,16 @@ export function createConsentService(
           "capture",
           site.tenantId,
           site.id,
-          context.idempotencyKey,
+          "",
+          options.siteKeyPepper,
+        ),
+        sourceBucketKeyHash: rateLimitKeyHash(
+          "source",
+          site.tenantId,
+          site.id,
+          trustedEdge
+            ? `${trustedEdge.source}\n${trustedEdge.ip}`
+            : "explicitly_unattributed",
           options.siteKeyPepper,
         ),
         replayBucketKeyHash: rateLimitKeyHash(
@@ -668,6 +793,9 @@ export function createConsentService(
         windowStartedAt,
         expiresAt: rateLimitExpiresAt,
         maxRequests: captureRateLimit.maxRequests,
+        sourceMaxRequests: trustedEdge
+          ? captureRateLimit.sourceMaxRequests
+          : captureRateLimit.maxRequests,
         replayMaxRequests: captureRateLimit.replayMaxRequests,
       });
       if (
@@ -720,8 +848,8 @@ export function createConsentService(
         origin: context.origin,
         occurred_at: new Date(occurredAt).toISOString(),
         user_agent: context.userAgent ?? null,
-        network: context.trustedEdge
-          ? { trusted_ip: context.trustedEdge.ip, source: context.trustedEdge.source }
+        network: trustedEdge
+          ? { trusted_ip: trustedEdge.ip, source: trustedEdge.source }
           : { trusted_ip: null, source: null },
       };
       const requestFingerprint = hashCanonicalEvidence(

@@ -75,9 +75,10 @@ describe("consent capture service", () => {
 
   function service(captureRateLimit?: {
     maxRequests: number;
+    sourceMaxRequests: number;
     replayMaxRequests: number;
     windowMs: number;
-  }) {
+  }, requireTrustedSource = false) {
     return createConsentService(createLibsqlConsentRepository(client), {
       siteKeyPepper: SITE_PEPPER,
       subjectHashKey: SUBJECT_KEY,
@@ -87,6 +88,7 @@ describe("consent capture service", () => {
       payloadKeyVersion: 3,
       retentionMs: RETENTION_MS,
       captureRateLimit,
+      requireTrustedSource,
       now: () => now,
       createId: (kind) => `${kind}-${randomUUID()}`,
     });
@@ -106,7 +108,7 @@ describe("consent capture service", () => {
       origin: "https://example.test",
       idempotencyKey: "idem-consent-0001",
       userAgent: "Consent Browser/1.0",
-      trustedEdge: { ip: "203.0.113.9", source: "cloudflare" },
+      trustedEdge: { ip: "8.8.8.8", source: "cloudflare" },
     });
 
     expect(result).toMatchObject({ created: true, tenantId, captureSiteId: siteId });
@@ -153,7 +155,7 @@ describe("consent capture service", () => {
       },
       affirmative_action: "form_submit",
       received_at: "2026-08-08T12:00:00.000Z",
-      network: { trusted_ip: "203.0.113.9", source: "cloudflare" },
+      network: { trusted_ip: "8.8.8.8", source: "cloudflare" },
     });
     expect(evidence).not.toHaveProperty("tenant_id", "attacker");
   });
@@ -325,6 +327,7 @@ describe("consent capture service", () => {
   it("enforces the fixed-window boundary and resets only in the next window", async () => {
     const capture = service({
       maxRequests: 2,
+      sourceMaxRequests: 2,
       replayMaxRequests: 2,
       windowMs: 1_000,
     });
@@ -365,15 +368,20 @@ describe("consent capture service", () => {
   });
 
   it("preserves bounded completed idempotent retries outside the site allowance", async () => {
-    const capture = service({
-      maxRequests: 1,
-      replayMaxRequests: 2,
-      windowMs: 60_000,
-    });
+    const capture = service(
+      {
+        maxRequests: 1,
+        sourceMaxRequests: 3,
+        replayMaxRequests: 2,
+        windowMs: 60_000,
+      },
+      true,
+    );
     const context = {
       siteKey: SITE_KEY,
       origin: "https://example.test",
       idempotencyKey: "idem-rate-replay-01",
+      trustedEdge: { ip: "8.8.8.8", source: "vercel" },
     };
     const original = await capture.capture(body, context);
     const firstReplay = await capture.capture(body, context);
@@ -399,7 +407,79 @@ describe("consent capture service", () => {
     expect(buckets.rows).toEqual([
       expect.objectContaining({ scope: "public_consent_capture", count: 1 }),
       expect.objectContaining({ scope: "public_consent_replay", count: 2 }),
+      expect.objectContaining({ scope: "public_consent_source", count: 3 }),
     ]);
+  });
+
+  it("applies the source cap across replays of many completed idempotency keys", async () => {
+    const source = { ip: "8.8.8.8", source: "vercel" };
+    const idempotencyKeys = [
+      "idem-replay-source-01",
+      "idem-replay-source-02",
+      "idem-replay-source-03",
+    ];
+    const seed = service(
+      {
+        maxRequests: 10,
+        sourceMaxRequests: 10,
+        replayMaxRequests: 10,
+        windowMs: 60_000,
+      },
+      true,
+    );
+    for (const idempotencyKey of idempotencyKeys) {
+      await seed.capture(body, {
+        siteKey: SITE_KEY,
+        origin: "https://example.test",
+        idempotencyKey,
+        trustedEdge: source,
+      });
+    }
+
+    now += 60_000;
+    const replay = service(
+      {
+        maxRequests: 120,
+        sourceMaxRequests: 2,
+        replayMaxRequests: 10,
+        windowMs: 60_000,
+      },
+      true,
+    );
+    for (const idempotencyKey of idempotencyKeys.slice(0, 2)) {
+      await expect(
+        replay.capture(body, {
+          siteKey: SITE_KEY,
+          origin: "https://example.test",
+          idempotencyKey,
+          trustedEdge: source,
+        }),
+      ).resolves.toMatchObject({ created: false });
+    }
+    await expect(
+      replay.capture(body, {
+        siteKey: SITE_KEY,
+        origin: "https://example.test",
+        idempotencyKey: idempotencyKeys[2],
+        trustedEdge: source,
+      }),
+    ).rejects.toMatchObject({ code: "rate_limited" });
+
+    const currentWindow = await client.execute({
+      sql: `SELECT scope, count FROM rate_limit_buckets
+            WHERE tenant_id = ? AND window_started_at = ?
+            ORDER BY scope, bucket_key_hash`,
+      args: [tenantId, NOW + 60_000],
+    });
+    expect(
+      currentWindow.rows.find((row) => row.scope === "public_consent_source"),
+    ).toMatchObject({ count: 2 });
+    expect(
+      currentWindow.rows.filter((row) => row.scope === "public_consent_replay"),
+    ).toHaveLength(2);
+    expect(
+      currentWindow.rows.some((row) => row.scope === "public_consent_capture"),
+    ).toBe(false);
   });
 
   it("atomically caps concurrent libSQL bucket consumption", async () => {
@@ -410,10 +490,12 @@ describe("consent capture service", () => {
           tenantId,
           idempotencyKey: `idem-atomic-${String(index).padStart(4, "0")}`,
           captureBucketKeyHash: "a".repeat(64),
+          sourceBucketKeyHash: "c".repeat(64),
           replayBucketKeyHash: "b".repeat(64),
           windowStartedAt: NOW,
           expiresAt: NOW + 60_000,
           maxRequests: 3,
+          sourceMaxRequests: 3,
           replayMaxRequests: 2,
         }),
       ),
@@ -421,13 +503,166 @@ describe("consent capture service", () => {
 
     expect(decisions.filter((decision) => decision.allowed)).toHaveLength(3);
     expect(decisions.filter((decision) => !decision.allowed)).toHaveLength(9);
-    const bucket = await client.execute({
-      sql: `SELECT count FROM rate_limit_buckets
-            WHERE tenant_id = ? AND scope = 'public_consent_capture'
-              AND bucket_key_hash = ?`,
-      args: [tenantId, "a".repeat(64)],
+    const buckets = await client.execute({
+      sql: `SELECT scope, count FROM rate_limit_buckets
+            WHERE tenant_id = ? AND scope IN (
+              'public_consent_capture', 'public_consent_source'
+            ) ORDER BY scope`,
+      args: [tenantId],
     });
-    expect(bucket.rows).toEqual([expect.objectContaining({ count: 3 })]);
+    expect(buckets.rows).toEqual([
+      expect.objectContaining({ scope: "public_consent_capture", count: 3 }),
+      expect.objectContaining({ scope: "public_consent_source", count: 3 }),
+    ]);
+  });
+
+  it("blocks an abusive source without consuming the aggregate allowance", async () => {
+    const capture = service(
+      {
+        maxRequests: 4,
+        sourceMaxRequests: 2,
+        replayMaxRequests: 2,
+        windowMs: 60_000,
+      },
+      true,
+    );
+    const sourceA = { ip: "8.8.8.8", source: "vercel" };
+    const sourceB = { ip: "1.1.1.1", source: "vercel" };
+    for (const idempotencyKey of ["idem-source-a-0001", "idem-source-a-0002"]) {
+      await capture.capture(body, {
+        siteKey: SITE_KEY,
+        origin: "https://example.test",
+        idempotencyKey,
+        trustedEdge: sourceA,
+      });
+    }
+    await expect(
+      capture.capture(body, {
+        siteKey: SITE_KEY,
+        origin: "https://example.test",
+        idempotencyKey: "idem-source-a-0003",
+        trustedEdge: sourceA,
+      }),
+    ).rejects.toMatchObject({ code: "rate_limited" });
+    await expect(
+      capture.capture(body, {
+        siteKey: SITE_KEY,
+        origin: "https://example.test",
+        idempotencyKey: "idem-source-b-0001",
+        trustedEdge: sourceB,
+      }),
+    ).resolves.toMatchObject({ created: true });
+
+    const buckets = await client.execute({
+      sql: `SELECT scope, count FROM rate_limit_buckets
+            WHERE tenant_id = ? ORDER BY scope, bucket_key_hash`,
+      args: [tenantId],
+    });
+    expect(
+      buckets.rows.find((row) => row.scope === "public_consent_capture"),
+    ).toMatchObject({ count: 3 });
+    expect(
+      buckets.rows
+        .filter((row) => row.scope === "public_consent_source")
+        .map((row) => Number(row.count))
+        .sort(),
+    ).toEqual([1, 2]);
+  });
+
+  it("keeps the aggregate backstop across distributed public sources", async () => {
+    const capture = service(
+      {
+        maxRequests: 2,
+        sourceMaxRequests: 2,
+        replayMaxRequests: 2,
+        windowMs: 60_000,
+      },
+      true,
+    );
+    for (const [index, ip] of ["8.8.8.8", "1.1.1.1"].entries()) {
+      await capture.capture(body, {
+        siteKey: SITE_KEY,
+        origin: "https://example.test",
+        idempotencyKey: `idem-distributed-${index + 1}`,
+        trustedEdge: { ip, source: "vercel" },
+      });
+    }
+    await expect(
+      capture.capture(body, {
+        siteKey: SITE_KEY,
+        origin: "https://example.test",
+        idempotencyKey: "idem-distributed-3",
+        trustedEdge: { ip: "9.9.9.9", source: "vercel" },
+      }),
+    ).rejects.toMatchObject({ code: "rate_limited" });
+
+    const buckets = await client.execute({
+      sql: `SELECT scope, count FROM rate_limit_buckets
+            WHERE tenant_id = ? ORDER BY scope, bucket_key_hash`,
+      args: [tenantId],
+    });
+    expect(
+      buckets.rows.find((row) => row.scope === "public_consent_capture"),
+    ).toMatchObject({ count: 2 });
+    expect(
+      buckets.rows.filter((row) => row.scope === "public_consent_source"),
+    ).toHaveLength(2);
+  });
+
+  it("fails closed when a required trusted source is unavailable", async () => {
+    const capture = service(undefined, true);
+    await expect(
+      capture.capture(body, {
+        siteKey: SITE_KEY,
+        origin: "https://example.test",
+        idempotencyKey: "idem-source-missing",
+      }),
+    ).rejects.toMatchObject({ code: "source_unavailable" });
+
+    const state = await client.execute(
+      `SELECT
+         (SELECT count(*) FROM rate_limit_buckets) AS buckets,
+         (SELECT count(*) FROM consent_logs) AS logs`,
+    );
+    expect(state.rows[0]).toMatchObject({ buckets: 0, logs: 0 });
+  });
+
+  it("stores only HMACs for source limiter identities", async () => {
+    const rawIp = "8.8.8.8";
+    await service(undefined, true).capture(body, {
+      siteKey: SITE_KEY,
+      origin: "https://example.test",
+      idempotencyKey: "idem-source-privacy",
+      trustedEdge: { ip: rawIp, source: "vercel" },
+    });
+
+    const buckets = await client.execute(
+      "SELECT bucket_key_hash FROM rate_limit_buckets",
+    );
+    expect(buckets.rows).toHaveLength(2);
+    for (const row of buckets.rows) {
+      expect(String(row.bucket_key_hash)).toMatch(/^[a-f0-9]{64}$/);
+      expect(String(row.bucket_key_hash)).not.toContain(rawIp);
+    }
+  });
+
+  it("treats an inactive tenant as a non-enumerating site miss", async () => {
+    await client.execute({
+      sql: "UPDATE tenants SET status = 'paused' WHERE id = ?",
+      args: [tenantId],
+    });
+    await expect(
+      service(undefined, true).capture(body, {
+        siteKey: SITE_KEY,
+        origin: "https://example.test",
+        idempotencyKey: "idem-paused-tenant",
+        trustedEdge: { ip: "8.8.8.8", source: "vercel" },
+      }),
+    ).rejects.toMatchObject({ code: "site_not_found" });
+    const buckets = await client.execute(
+      "SELECT count(*) AS count FROM rate_limit_buckets",
+    );
+    expect(Number(buckets.rows[0].count)).toBe(0);
   });
 
   it("gives each capture site an independent tenant-scoped allowance", async () => {
@@ -456,6 +691,7 @@ describe("consent capture service", () => {
     });
     const capture = service({
       maxRequests: 1,
+      sourceMaxRequests: 1,
       replayMaxRequests: 1,
       windowMs: 60_000,
     });
@@ -525,6 +761,7 @@ describe("consent capture service", () => {
     );
     const capture = service({
       maxRequests: 1,
+      sourceMaxRequests: 1,
       replayMaxRequests: 1,
       windowMs: 60_000,
     });
@@ -583,6 +820,7 @@ describe("consent capture service", () => {
         payloadEncryptionKey: ENCRYPTION_KEY,
         payloadKeyVersion: 3,
         retentionMs: RETENTION_MS,
+        requireTrustedSource: false,
         now: () => now,
       },
     );
