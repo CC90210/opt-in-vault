@@ -4,6 +4,11 @@ import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 
 import type { Client } from "@libsql/client";
 
+import {
+  authenticateRequest,
+  parseApiKeyPepperRing,
+} from "@/server/auth/request";
+
 const CODE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const SHARE_TOKEN_PATTERN = /^oiv_share_[A-Za-z0-9_-]{43}$/;
 const HEX_SHA256_PATTERN = /^[a-f0-9]{64}$/;
@@ -81,6 +86,16 @@ export function resolveVersionedConsentValue(options: {
 }
 
 type TenantPrincipal = { tenantId: string };
+
+const CERTIFICATE_READ_SCOPES = new Set([
+  "admin",
+  "consent:read",
+  "certificate:read",
+]);
+
+type CertificateAuthEnvironment = Readonly<
+  Record<string, string | undefined>
+>;
 
 type RouteContext = {
   params: Promise<{ code: string }>;
@@ -242,84 +257,19 @@ async function findStoredCertificate(
   };
 }
 
-function cookieValue(request: Request, name: string): string | null {
-  const cookie = request.headers.get("cookie") ?? "";
-  for (const part of cookie.split(";")) {
-    const separator = part.indexOf("=");
-    if (separator < 0 || part.slice(0, separator).trim() !== name) continue;
-    try {
-      return decodeURIComponent(part.slice(separator + 1).trim());
-    } catch {
-      return null;
-    }
-  }
-  return null;
-}
-
-async function authorizeProductionTenant(
+export async function authorizeCertificateTenant(
   client: Client,
   request: Request,
+  environment: CertificateAuthEnvironment = process.env,
+  options: { now?: () => number } = {},
 ): Promise<TenantPrincipal | null> {
-  const sessionModule = await import("@/server/auth/session");
-  const sessionToken = cookieValue(request, sessionModule.SESSION_COOKIE_NAME);
-  const sessionSecret = process.env.SESSION_SECRET;
-  if (sessionToken && sessionSecret) {
-    const claims = sessionModule.verifySessionToken(sessionToken, sessionSecret);
-    if (
-      claims &&
-      claims.scopes.some((scope) =>
-        ["admin", "consent:read", "certificate:read"].includes(scope),
-      )
-    ) {
-      return { tenantId: claims.tenantId };
-    }
-  }
-
-  const authorization = request.headers.get("authorization") ?? "";
-  const match = /^Bearer (oiv_sk_[A-Za-z0-9_-]{43})$/.exec(authorization);
-  const pepper = process.env.API_KEY_PEPPER;
-  if (!match || !pepper) return null;
-  const rawKey = match[1];
-  const result = await client.execute({
-    sql: `SELECT id, tenant_id, prefix, key_hash, hash_key_version, scopes_json,
-                 expires_at, revoked_at
-          FROM tenant_api_keys
-          WHERE prefix = ?
-          LIMIT 1`,
-    args: [rawKey.slice(0, 18)],
+  const principal = await authenticateRequest(client, request, {
+    apiKeyPeppers: parseApiKeyPepperRing(environment),
+    sessionSecret: environment.SESSION_SECRET ?? "",
+    now: options.now,
   });
-  const row = result.rows[0];
-  if (!row) return null;
-  let scopes: string[];
-  try {
-    const parsed: unknown = JSON.parse(String(row.scopes_json));
-    if (!Array.isArray(parsed) || !parsed.every((scope) => typeof scope === "string")) {
-      return null;
-    }
-    scopes = parsed;
-  } catch {
-    return null;
-  }
-  const apiKeys = await import("@/server/auth/api-keys");
-  const hashKeyVersion = Number(row.hash_key_version);
-  const principal = apiKeys.authenticateApiKey(
-    rawKey,
-    {
-      id: String(row.id),
-      tenantId: String(row.tenant_id),
-      prefix: String(row.prefix),
-      hash: String(row.key_hash),
-      hashKeyVersion,
-      scopes,
-      expiresAt: row.expires_at == null ? null : Number(row.expires_at),
-      revokedAt: row.revoked_at == null ? null : Number(row.revoked_at),
-    },
-    { [hashKeyVersion]: pepper },
-  );
-  return principal &&
-    principal.scopes.some((scope) =>
-      ["admin", "consent:read", "certificate:read"].includes(scope),
-    )
+
+  return principal && principal.scopes.some((scope) => CERTIFICATE_READ_SCOPES.has(scope))
     ? { tenantId: principal.tenantId }
     : null;
 }
@@ -343,7 +293,7 @@ async function productionDependencies(): Promise<CertificateDependencies> {
 
   return {
     findCertificate: (code) => findStoredCertificate(database.client, code),
-    authorizeTenant: (request) => authorizeProductionTenant(database.client, request),
+    authorizeTenant: (request) => authorizeCertificateTenant(database.client, request),
     hashShareToken(rawToken) {
       const pepper = process.env.CERTIFICATE_SHARE_TOKEN_PEPPER;
       if (!pepper) {
