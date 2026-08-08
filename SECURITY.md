@@ -53,7 +53,7 @@ Live SMTP requires both `LIVE_SENDS_ENABLED=true` and an active, approved campai
 - Rendered content and Message-ID are persisted so retries cannot silently change material.
 - A definitive rejection may retry with bounded backoff; a possibly accepted/ambiguous result becomes `unknown` and is never automatically resent.
 - RFC 8058 messages contain both required headers and a visible HTTPS unsubscribe URL.
-- Live delivery requires application-controlled local DKIM signing that covers both RFC 8058 headers. Provider-managed DKIM can be recorded for DNS visibility, but live transport creation fails closed because the application cannot prove header coverage.
+- Live delivery requires application-controlled local DKIM signing that covers both RFC 8058 headers. Before OAuth or SMTP construction, the dispatcher binds the exact fresh DNS snapshot to its domain/selector/mode and compares the normalized RSA public key with the public key derived from the encrypted PEM. Provider-managed DKIM remains live-blocked because the application cannot prove header coverage.
 - `GET /api/v1/unsubscribe` never mutates. The exact one-click form POST is idempotent and applies suppression transactionally.
 
 Setting `LIVE_SENDS_ENABLED=false` and pausing active campaigns are the immediate containment controls. They cannot retract a message already accepted by a provider.
@@ -61,6 +61,8 @@ Setting `LIVE_SENDS_ENABLED=false` and pausing active campaigns are the immediat
 ### Consent evidence
 
 Consent capture binds an active publishable site key to an exact allowed origin, registered disclosure version, configured channel set, and form URL rule. It requires an idempotency key and rejects payloads that try to provide a tenant ID.
+
+The public route incrementally enforces a 32 KiB UTF-8 body limit even without `Content-Length`. Durable tenant/site fixed-window limiting defaults to 120 new captures per minute; completed idempotent retries use a separate 10-per-minute HMAC-keyed bucket. Limiter uncertainty fails closed before evidence persistence. Expired bucket rows are indexed but this MVP does not prune them automatically.
 
 Evidence payloads are canonicalized, SHA-256 hashed, HMAC signed with a recorded key version, and encrypted with AES-256-GCM. Database triggers reject updates and deletes to `consent_logs`; corrections must be appended as new evidence.
 

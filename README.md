@@ -13,12 +13,12 @@ The application uses Next.js 15, React 19, Turso/libSQL, Drizzle ORM, Nodemailer
 - One-cycle dispatch and inbox-poll workers, plus cron-authenticated HTTP equivalents.
 - A fail-closed outbound gateway for SMTP 465 with implicit TLS or SMTP 587 with required STARTTLS.
 - Password SMTP and Google/Microsoft OAuth credential payloads, encrypted at rest with versioned AES-256-GCM keys.
-- Local DKIM signing for live RFC 8058 delivery, plus honestly labelled provider-managed DKIM snapshots that remain blocked from live delivery because header coverage cannot be proved.
+- Local DKIM signing for live RFC 8058 delivery, with a fresh source-bound DNS snapshot and cryptographic private/public-key match; provider-managed snapshots remain blocked from live delivery because header coverage cannot be proved.
 - Durable message material, stable Message-IDs, quota reservations, suppression rechecks, and quarantine of unknown delivery outcomes.
 - RFC 8058 one-click unsubscribe with a non-mutating GET and an idempotent POST.
-- Browser JavaScript and dependency-free Python consent clients, immutable evidence rows, verified certificate PDFs, and explicit retention deadlines.
+- Browser JavaScript and dependency-free Python consent clients, bounded/rate-limited public capture, immutable evidence rows, verified certificate PDFs, and explicit retention deadlines.
 
-The current MVP has no public registration, tenant bootstrap command, mailbox/campaign CRUD UI, or automatic retention-key destruction job. Trusted operators must provision tenant, API-key, capture-site, inbox, and campaign records through a controlled administrative database workflow.
+The current MVP has no public registration, tenant bootstrap command, mailbox/campaign CRUD UI, automatic retention-key destruction job, or expired rate-limit-bucket pruning job. Trusted operators must provision tenant, API-key, capture-site, inbox, and campaign records through a controlled administrative database workflow.
 
 ## Local setup
 
@@ -57,7 +57,7 @@ Use `npm run db:generate` only when intentionally authoring a schema migration. 
 1. Runtime lock: `LIVE_SENDS_ENABLED=true`.
 2. Campaign lock: `status='active'`, `approved_at` is set, and `dry_run=false`.
 
-Inbox, domain, schedule, quota, suppression, enrollment, and tenant gates must also pass. The latest usable DNS snapshot must be no more than 24 hours old, and live delivery requires local DKIM material so both one-click unsubscribe headers are covered. With either activation layer closed, dispatch persists a dry-run preview and defers the job without constructing a mail transport.
+Inbox, domain, schedule, quota, suppression, enrollment, and tenant gates must also pass. The latest usable DNS snapshot must be no more than 24 hours old, identify the exact domain/selector/local mode, and contain the RSA public key derived from the provisioned private key. Live delivery requires that local key so both one-click unsubscribe headers are covered. With either activation layer closed, dispatch persists a dry-run preview and defers the job without constructing a mail transport.
 
 Do not enable live delivery until the operator checklist in [`docs/operations/runbook.md`](docs/operations/runbook.md) is complete.
 

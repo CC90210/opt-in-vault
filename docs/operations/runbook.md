@@ -199,7 +199,7 @@ During rotation, add the old key to `CREDENTIAL_ENCRYPTION_KEYS_JSON` before cha
 
 ### DKIM modes
 
-`dkim_mode='local'` requires a selector and `dkimPrivateKey`. Nodemailer signs the normal message fields plus both `List-Unsubscribe` and `List-Unsubscribe-Post`.
+`dkim_mode='local'` requires a selector and `dkimPrivateKey`. The DNS snapshot records its normalized domain, selector, and mode. Before OAuth refresh or SMTP construction, live dispatch requires that exact snapshot to be unique, usable, no more than 24 hours old, and to contain the RSA public key derived from the configured private key. Nodemailer then signs the normal message fields plus both `List-Unsubscribe` and `List-Unsubscribe-Post`.
 
 `dkim_mode='provider'` does not load a local private key. A selector record must still be present for the DNS gate, but the application can only label it `present_provider_managed`; it does not verify the signature on a delivered message or prove domain alignment. Live transport creation therefore fails closed with `rfc8058_dkim_signing_unverified`. Use `dkim_mode='local'` for live delivery.
 
@@ -217,12 +217,12 @@ The scanner separates send readiness from assurance level. Both `healthy` and wa
 These checks are deliberately limited:
 
 - SPF inspection is a bounded structural heuristic, not recursive evaluation from the actual sending IP.
-- DKIM checks record/public-key shape, not possession of the matching private key or the signature on a sent message.
+- The scanner alone checks DKIM record/public-key shape. Live local-DKIM transport adds a cryptographic private/public-key match against that exact snapshot, but neither step verifies the signature on a provider-accepted message.
 - DMARC checks the published policy, not message-level SPF/DKIM alignment.
 - MX proves a record exists, not that the mailbox can receive.
 - DNS health does not guarantee provider acceptance, reputation, deliverability, or inbox placement.
 
-Run the scan after every DNS or selector change and wait for real DNS propagation. A dispatch claim requires a usable snapshot no more than 24 hours old; unchecked, future-dated, or stale snapshots fail closed. Do not manually mark a domain healthy to bypass a failed snapshot.
+Run the scan after every DNS, selector, mode, or private-key change and wait for real DNS propagation. Snapshots created before source binding was introduced must also be rescanned once. A dispatch claim requires a usable snapshot no more than 24 hours old; unchecked, ambiguous, future-dated, stale, source-mismatched, or key-mismatched snapshots fail closed. Do not manually mark a domain healthy to bypass a failed snapshot.
 
 ## 7. Campaign schedules and activation
 
@@ -273,7 +273,7 @@ Dry run is durable: the worker renders and stores the preview material and stabl
 3. Run migrations and the complete verification gate.
 4. Confirm tenant, campaign, enrollment, lead, inbox, and domain state from live database records.
 5. Confirm suppression hashes use the current `SUPPRESSION_HASH_KEY` and test a known synthetic suppression.
-6. Run DNS scan. Require persisted `healthy` or explicitly review a send-ready `degraded` DMARC-monitoring warning; never infer readiness from raw records alone.
+6. Run a new DNS scan after provisioning the final local DKIM key. Require persisted `healthy` or explicitly review a send-ready `degraded` DMARC-monitoring warning; live dispatch will independently reject a snapshot whose source or RSA public key does not match.
 7. Poll a test inbox successfully and confirm its cursor/auth state.
 8. Run dispatch with `LIVE_SENDS_ENABLED=false`; inspect dry-run summary and persisted rendered material.
 9. Set the campaign active/approved while leaving `dry_run=true`; repeat dry run.

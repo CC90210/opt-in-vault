@@ -101,7 +101,7 @@ Idempotency-Key: signup-event-00000001
 X-OptInVault-Site-Key: oiv_pk_REPLACE_WITH_PUBLISHABLE_SITE_KEY
 ```
 
-`Authorization: Publishable <site-key>` is accepted as an alternative to `X-OptInVault-Site-Key`; if both are present they must be identical. The JSON body is capped at 32 KiB and may contain only:
+`Authorization: Publishable <site-key>` is accepted as an alternative to `X-OptInVault-Site-Key`; if both are present they must be identical. The exact media type is `application/json` (parameters such as a charset are allowed). The UTF-8 JSON body is read incrementally, capped at 32 KiB even when `Content-Length` is absent, and may contain only:
 
 ```json
 {
@@ -132,11 +132,17 @@ A new record returns 201; an idempotent replay returns 200 with `created: false`
 }
 ```
 
-Operational error codes include invalid request/site, inactive site, origin/form/disclosure mismatch, idempotency conflict, and evidence verification failure. Do not turn a rejected capture into a local “success” record; surface or queue the failure with the same idempotency key.
+Operational error codes include invalid request/site, inactive site, origin/form/disclosure mismatch, rate limiting, idempotency conflict, and evidence verification failure. A rate-limited request returns HTTP 429 with `Retry-After`. Do not turn a rejected capture into a local “success” record; surface or queue the failure with the same idempotency key.
 
 ### Idempotency
 
 The idempotency key is 8–128 characters from the accepted identifier alphabet. Replaying the same action returns the stored record after decrypting and verifying it. Reusing a key for materially different evidence returns `idempotency_conflict`.
+
+### Public capture rate limit
+
+The production route uses a durable fixed window: 120 new capture attempts per active tenant/site per minute. Once an idempotency key has produced evidence, its safe retries move to a separate HMAC-keyed bucket capped at 10 per minute, so ordinary retries do not consume the site's new-capture allowance. Bucket keys do not contain raw email, phone, IP, site ID, or idempotency text, and database/decision errors stop capture before evidence persistence.
+
+Expired bucket rows are indexed by `expires_at`, but the MVP has no automatic pruning job. Include bounded expired-row pruning in controlled database maintenance and monitor table growth; pruning old buckets does not alter immutable consent evidence.
 
 ## 5. What the evidence contains
 
@@ -167,7 +173,7 @@ Database triggers reject update and delete operations on consent rows. Correctio
 
 `GET /api/v1/certificate/{code}` renders a remote-resource-free PDF only after it decrypts the canonical payload and verifies canonical encoding, SHA-256, HMAC, and key versions.
 
-Normal access requires the same tenant through a valid session/API key with `admin`, `consent:read`, or `certificate:read`. External sharing, when separately provisioned, uses:
+Normal access requires the same **active** tenant through a valid session/API key with `admin`, `consent:read`, or `certificate:read`; API-key verification honors the configured current/historical pepper ring. External sharing, when separately provisioned, uses:
 
 ```text
 Authorization: Share <opaque share token>
