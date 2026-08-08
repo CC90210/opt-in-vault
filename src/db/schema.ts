@@ -30,7 +30,6 @@ export const tenants = sqliteTable(
   },
   (table) => [
     uniqueIndex("tenants_slug_uq").on(table.slug),
-    uniqueIndex("tenants_id_id_uq").on(table.id, table.id),
     check("tenants_status_ck", sql`${table.status} IN ('active', 'paused', 'archived')`),
     check("tenants_daily_limit_ck", sql`${table.dailyLimit} BETWEEN 1 AND 10000`),
   ],
@@ -43,6 +42,7 @@ export const tenantApiKeys = sqliteTable(
     tenantId: text("tenant_id").notNull().references(() => tenants.id, { onDelete: "restrict" }),
     prefix: text("prefix").notNull(),
     keyHash: text("key_hash").notNull(),
+    hashKeyVersion: integer("hash_key_version").notNull().default(1),
     scopesJson: text("scopes_json").notNull().default("[]"),
     expiresAt: integer("expires_at"),
     revokedAt: integer("revoked_at"),
@@ -54,6 +54,8 @@ export const tenantApiKeys = sqliteTable(
     uniqueIndex("tenant_api_keys_hash_uq").on(table.keyHash),
     uniqueIndex("tenant_api_keys_tenant_id_id_uq").on(table.tenantId, table.id),
     index("tenant_api_keys_tenant_idx").on(table.tenantId, table.revokedAt),
+    check("tenant_api_keys_hash_key_version_ck", sql`${table.hashKeyVersion} >= 1`),
+    check("tenant_api_keys_scopes_json_ck", sql`json_valid(${table.scopesJson})`),
   ],
 );
 
@@ -80,6 +82,8 @@ export const captureSites = sqliteTable(
     uniqueIndex("capture_sites_tenant_id_id_uq").on(table.tenantId, table.id),
     index("capture_sites_tenant_idx").on(table.tenantId, table.status),
     check("capture_sites_status_ck", sql`${table.status} IN ('active', 'paused', 'revoked')`),
+    check("capture_sites_origins_json_ck", sql`json_valid(${table.allowedOriginsJson})`),
+    check("capture_sites_channels_json_ck", sql`json_valid(${table.channelsJson})`),
   ],
 );
 
@@ -128,6 +132,7 @@ export const dnsChecks = sqliteTable(
       foreignColumns: [sendingDomains.tenantId, sendingDomains.id],
     }).onDelete("restrict"),
     check("dns_checks_status_ck", sql`${table.status} IN ('healthy', 'degraded', 'blocked', 'error')`),
+    check("dns_checks_records_json_ck", sql`json_valid(${table.recordsJson})`),
   ],
 );
 
@@ -196,6 +201,7 @@ export const campaigns = sqliteTable(
     check("campaigns_status_ck", sql`${table.status} IN ('draft', 'ready', 'active', 'paused', 'completed')`),
     check("campaigns_jitter_min_ck", sql`${table.jitterMinSeconds} BETWEEN 0 AND 3600`),
     check("campaigns_jitter_max_ck", sql`${table.jitterMaxSeconds} >= ${table.jitterMinSeconds} AND ${table.jitterMaxSeconds} <= 3600`),
+    check("campaigns_schedule_json_ck", sql`json_valid(${table.scheduleJson})`),
   ],
 );
 
@@ -214,6 +220,11 @@ export const sequenceSteps = sqliteTable(
   },
   (table) => [
     uniqueIndex("sequence_steps_tenant_id_id_uq").on(table.tenantId, table.id),
+    uniqueIndex("sequence_steps_campaign_identity_uq").on(
+      table.tenantId,
+      table.id,
+      table.campaignId,
+    ),
     uniqueIndex("sequence_steps_campaign_order_uq").on(table.tenantId, table.campaignId, table.stepOrder),
     foreignKey({
       name: "sequence_steps_campaign_fk",
@@ -247,6 +258,7 @@ export const leads = sqliteTable(
   (table) => [
     uniqueIndex("leads_tenant_id_id_uq").on(table.tenantId, table.id),
     uniqueIndex("leads_tenant_email_uq").on(table.tenantId, table.normalizedEmail),
+    uniqueIndex("leads_tenant_phone_uq").on(table.tenantId, table.normalizedPhone),
     index("leads_tenant_status_idx").on(table.tenantId, table.status),
     check("leads_status_ck", sql`${table.status} IN ('active', 'replied', 'unsubscribed', 'bounced', 'complained', 'archived')`),
   ],
@@ -269,6 +281,12 @@ export const campaignEnrollments = sqliteTable(
   },
   (table) => [
     uniqueIndex("campaign_enrollments_tenant_id_id_uq").on(table.tenantId, table.id),
+    uniqueIndex("campaign_enrollments_identity_uq").on(
+      table.tenantId,
+      table.id,
+      table.campaignId,
+      table.leadId,
+    ),
     uniqueIndex("campaign_enrollments_campaign_lead_uq").on(table.tenantId, table.campaignId, table.leadId),
     index("campaign_enrollments_due_idx").on(table.tenantId, table.status, table.nextSendAt),
     foreignKey({ name: "campaign_enrollments_campaign_fk", columns: [table.tenantId, table.campaignId], foreignColumns: [campaigns.tenantId, campaigns.id] }).onDelete("restrict"),
@@ -293,6 +311,11 @@ export const unsubscribeTokens = sqliteTable(
   (table) => [
     uniqueIndex("unsubscribe_tokens_hash_uq").on(table.tokenHash),
     uniqueIndex("unsubscribe_tokens_tenant_id_id_uq").on(table.tenantId, table.id),
+    uniqueIndex("unsubscribe_tokens_lead_identity_uq").on(
+      table.tenantId,
+      table.id,
+      table.leadId,
+    ),
     index("unsubscribe_tokens_expiry_idx").on(table.tenantId, table.expiresAt, table.revokedAt),
     foreignKey({ name: "unsubscribe_tokens_lead_fk", columns: [table.tenantId, table.leadId], foreignColumns: [leads.tenantId, leads.id] }).onDelete("restrict"),
   ],
@@ -304,6 +327,8 @@ export const sendJobs = sqliteTable(
     id: text("id").primaryKey(),
     tenantId: text("tenant_id").notNull().references(() => tenants.id, { onDelete: "restrict" }),
     enrollmentId: text("enrollment_id").notNull(),
+    campaignId: text("campaign_id").notNull(),
+    leadId: text("lead_id").notNull(),
     stepId: text("step_id").notNull(),
     inboxId: text("inbox_id"),
     unsubscribeTokenId: text("unsubscribe_token_id"),
@@ -321,12 +346,40 @@ export const sendJobs = sqliteTable(
   },
   (table) => [
     uniqueIndex("send_jobs_tenant_id_id_uq").on(table.tenantId, table.id),
+    uniqueIndex("send_jobs_delivery_identity_uq").on(
+      table.tenantId,
+      table.id,
+      table.leadId,
+      table.inboxId,
+    ),
     uniqueIndex("send_jobs_enrollment_step_uq").on(table.tenantId, table.enrollmentId, table.stepId),
-    index("send_jobs_due_idx").on(table.status, table.dueAt, table.leaseExpiresAt),
-    foreignKey({ name: "send_jobs_enrollment_fk", columns: [table.tenantId, table.enrollmentId], foreignColumns: [campaignEnrollments.tenantId, campaignEnrollments.id] }).onDelete("restrict"),
-    foreignKey({ name: "send_jobs_step_fk", columns: [table.tenantId, table.stepId], foreignColumns: [sequenceSteps.tenantId, sequenceSteps.id] }).onDelete("restrict"),
+    index("send_jobs_queued_due_idx")
+      .on(table.dueAt)
+      .where(sql`${table.status} = 'queued'`),
+    index("send_jobs_expired_lease_idx")
+      .on(table.leaseExpiresAt)
+      .where(sql`${table.status} = 'leased'`),
+    foreignKey({
+      name: "send_jobs_enrollment_fk",
+      columns: [table.tenantId, table.enrollmentId, table.campaignId, table.leadId],
+      foreignColumns: [
+        campaignEnrollments.tenantId,
+        campaignEnrollments.id,
+        campaignEnrollments.campaignId,
+        campaignEnrollments.leadId,
+      ],
+    }).onDelete("restrict"),
+    foreignKey({
+      name: "send_jobs_step_fk",
+      columns: [table.tenantId, table.stepId, table.campaignId],
+      foreignColumns: [sequenceSteps.tenantId, sequenceSteps.id, sequenceSteps.campaignId],
+    }).onDelete("restrict"),
     foreignKey({ name: "send_jobs_inbox_fk", columns: [table.tenantId, table.inboxId], foreignColumns: [sendingInboxes.tenantId, sendingInboxes.id] }).onDelete("restrict"),
-    foreignKey({ name: "send_jobs_unsubscribe_fk", columns: [table.tenantId, table.unsubscribeTokenId], foreignColumns: [unsubscribeTokens.tenantId, unsubscribeTokens.id] }).onDelete("restrict"),
+    foreignKey({
+      name: "send_jobs_unsubscribe_fk",
+      columns: [table.tenantId, table.unsubscribeTokenId, table.leadId],
+      foreignColumns: [unsubscribeTokens.tenantId, unsubscribeTokens.id, unsubscribeTokens.leadId],
+    }).onDelete("restrict"),
     check("send_jobs_status_ck", sql`${table.status} IN ('queued', 'leased', 'sending', 'sent', 'failed', 'unknown', 'cancelled')`),
     check("send_jobs_attempt_count_ck", sql`${table.attemptCount} >= 0`),
   ],
@@ -378,10 +431,15 @@ export const outboundMessages = sqliteTable(
     uniqueIndex("outbound_messages_tenant_id_id_uq").on(table.tenantId, table.id),
     uniqueIndex("outbound_messages_job_uq").on(table.tenantId, table.jobId),
     uniqueIndex("outbound_messages_message_id_uq").on(table.messageId),
-    foreignKey({ name: "outbound_messages_job_fk", columns: [table.tenantId, table.jobId], foreignColumns: [sendJobs.tenantId, sendJobs.id] }).onDelete("restrict"),
+    foreignKey({
+      name: "outbound_messages_job_fk",
+      columns: [table.tenantId, table.jobId, table.leadId, table.inboxId],
+      foreignColumns: [sendJobs.tenantId, sendJobs.id, sendJobs.leadId, sendJobs.inboxId],
+    }).onDelete("restrict"),
     foreignKey({ name: "outbound_messages_lead_fk", columns: [table.tenantId, table.leadId], foreignColumns: [leads.tenantId, leads.id] }).onDelete("restrict"),
     foreignKey({ name: "outbound_messages_inbox_fk", columns: [table.tenantId, table.inboxId], foreignColumns: [sendingInboxes.tenantId, sendingInboxes.id] }).onDelete("restrict"),
     check("outbound_messages_status_ck", sql`${table.status} IN ('prepared', 'accepted', 'rejected', 'unknown')`),
+    check("outbound_messages_headers_json_ck", sql`json_valid(${table.headersJson})`),
   ],
 );
 
@@ -422,6 +480,7 @@ export const workerRuns = sqliteTable(
     uniqueIndex("worker_runs_bucket_uq").on(table.tenantId, table.runType, table.bucketKey),
     check("worker_runs_type_ck", sql`${table.runType} IN ('dispatch', 'poll_inboxes', 'dns')`),
     check("worker_runs_status_ck", sql`${table.status} IN ('running', 'completed', 'failed')`),
+    check("worker_runs_stats_json_ck", sql`json_valid(${table.statsJson})`),
   ],
 );
 
@@ -468,6 +527,8 @@ export const inboundMessages = sqliteTable(
     uniqueIndex("inbound_messages_uid_uq").on(table.tenantId, table.inboxId, table.uidValidity, table.uid),
     index("inbound_messages_message_id_idx").on(table.tenantId, table.messageId),
     foreignKey({ name: "inbound_messages_inbox_fk", columns: [table.tenantId, table.inboxId], foreignColumns: [sendingInboxes.tenantId, sendingInboxes.id] }).onDelete("restrict"),
+    check("inbound_messages_references_json_ck", sql`json_valid(${table.referencesJson})`),
+    check("inbound_messages_headers_json_ck", sql`json_valid(${table.headersJson})`),
   ],
 );
 
@@ -504,13 +565,15 @@ export const consentLogs = sqliteTable(
     purpose: text("purpose").notNull(),
     disclosureVersion: text("disclosure_version").notNull(),
     affirmativeAction: text("affirmative_action").notNull(),
-    canonicalPayload: text("canonical_payload").notNull(),
+    canonicalPayloadCiphertext: blob("canonical_payload_ciphertext", { mode: "buffer" }).notNull(),
+    payloadKeyVersion: integer("payload_key_version").notNull(),
     payloadSha256: text("payload_sha256").notNull(),
     signatureHmac: text("signature_hmac").notNull(),
     signatureKeyVersion: integer("signature_key_version").notNull(),
     priorHash: text("prior_hash"),
     idempotencyKey: text("idempotency_key").notNull(),
     occurredAt: integer("occurred_at").notNull(),
+    retentionExpiresAt: integer("retention_expires_at").notNull(),
     receivedAt: integer("received_at").notNull().default(nowMs),
   },
   (table) => [
@@ -518,6 +581,9 @@ export const consentLogs = sqliteTable(
     uniqueIndex("consent_logs_idempotency_uq").on(table.tenantId, table.idempotencyKey),
     index("consent_logs_subject_idx").on(table.tenantId, table.subjectIdentifierHash, table.occurredAt),
     foreignKey({ name: "consent_logs_site_fk", columns: [table.tenantId, table.captureSiteId], foreignColumns: [captureSites.tenantId, captureSites.id] }).onDelete("restrict"),
+    check("consent_logs_payload_key_version_ck", sql`${table.payloadKeyVersion} >= 1`),
+    check("consent_logs_signature_key_version_ck", sql`${table.signatureKeyVersion} >= 1`),
+    check("consent_logs_retention_ck", sql`${table.retentionExpiresAt} > ${table.receivedAt}`),
   ],
 );
 
@@ -579,6 +645,7 @@ export const suppressionEvents = sqliteTable(
     index("suppression_events_suppression_idx").on(table.tenantId, table.suppressionId, table.createdAt),
     foreignKey({ name: "suppression_events_suppression_fk", columns: [table.tenantId, table.suppressionId], foreignColumns: [suppressions.tenantId, suppressions.id] }).onDelete("restrict"),
     check("suppression_events_action_ck", sql`${table.action} IN ('added', 'confirmed', 'imported')`),
+    check("suppression_events_metadata_json_ck", sql`json_valid(${table.metadataJson})`),
   ],
 );
 
@@ -600,6 +667,7 @@ export const notifications = sqliteTable(
     index("notifications_due_idx").on(table.status, table.nextAttemptAt),
     check("notifications_status_ck", sql`${table.status} IN ('pending', 'sent', 'failed')`),
     check("notifications_attempts_ck", sql`${table.attempts} >= 0`),
+    check("notifications_payload_json_ck", sql`json_valid(${table.payloadJson})`),
   ],
 );
 
@@ -619,6 +687,7 @@ export const auditEvents = sqliteTable(
   (table) => [
     uniqueIndex("audit_events_tenant_id_id_uq").on(table.tenantId, table.id),
     index("audit_events_resource_idx").on(table.tenantId, table.resourceType, table.resourceId, table.createdAt),
+    check("audit_events_metadata_json_ck", sql`json_valid(${table.metadataJson})`),
   ],
 );
 
@@ -669,4 +738,3 @@ export const schema = {
   auditEvents,
   rateLimitBuckets,
 };
-

@@ -1,3 +1,5 @@
+import "server-only";
+
 import { createClient, type Client } from "@libsql/client";
 import { drizzle } from "drizzle-orm/libsql";
 
@@ -28,4 +30,3 @@ export async function createDatabase(options: {
     db: drizzle(client, { schema }),
   };
 }
-

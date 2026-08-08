@@ -8,7 +8,8 @@ CREATE TABLE `audit_events` (
 	`resource_id` text,
 	`metadata_json` text DEFAULT '{}' NOT NULL,
 	`created_at` integer DEFAULT (unixepoch('subsec') * 1000) NOT NULL,
-	FOREIGN KEY (`tenant_id`) REFERENCES `tenants`(`id`) ON UPDATE no action ON DELETE restrict
+	FOREIGN KEY (`tenant_id`) REFERENCES `tenants`(`id`) ON UPDATE no action ON DELETE restrict,
+	CONSTRAINT "audit_events_metadata_json_ck" CHECK(json_valid("audit_events"."metadata_json"))
 );
 --> statement-breakpoint
 CREATE UNIQUE INDEX `audit_events_tenant_id_id_uq` ON `audit_events` (`tenant_id`,`id`);--> statement-breakpoint
@@ -33,6 +34,7 @@ CREATE TABLE `campaign_enrollments` (
 );
 --> statement-breakpoint
 CREATE UNIQUE INDEX `campaign_enrollments_tenant_id_id_uq` ON `campaign_enrollments` (`tenant_id`,`id`);--> statement-breakpoint
+CREATE UNIQUE INDEX `campaign_enrollments_identity_uq` ON `campaign_enrollments` (`tenant_id`,`id`,`campaign_id`,`lead_id`);--> statement-breakpoint
 CREATE UNIQUE INDEX `campaign_enrollments_campaign_lead_uq` ON `campaign_enrollments` (`tenant_id`,`campaign_id`,`lead_id`);--> statement-breakpoint
 CREATE INDEX `campaign_enrollments_due_idx` ON `campaign_enrollments` (`tenant_id`,`status`,`next_send_at`);--> statement-breakpoint
 CREATE TABLE `campaigns` (
@@ -52,7 +54,8 @@ CREATE TABLE `campaigns` (
 	FOREIGN KEY (`tenant_id`) REFERENCES `tenants`(`id`) ON UPDATE no action ON DELETE restrict,
 	CONSTRAINT "campaigns_status_ck" CHECK("campaigns"."status" IN ('draft', 'ready', 'active', 'paused', 'completed')),
 	CONSTRAINT "campaigns_jitter_min_ck" CHECK("campaigns"."jitter_min_seconds" BETWEEN 0 AND 3600),
-	CONSTRAINT "campaigns_jitter_max_ck" CHECK("campaigns"."jitter_max_seconds" >= "campaigns"."jitter_min_seconds" AND "campaigns"."jitter_max_seconds" <= 3600)
+	CONSTRAINT "campaigns_jitter_max_ck" CHECK("campaigns"."jitter_max_seconds" >= "campaigns"."jitter_min_seconds" AND "campaigns"."jitter_max_seconds" <= 3600),
+	CONSTRAINT "campaigns_schedule_json_ck" CHECK(json_valid("campaigns"."schedule_json"))
 );
 --> statement-breakpoint
 CREATE UNIQUE INDEX `campaigns_tenant_id_id_uq` ON `campaigns` (`tenant_id`,`id`);--> statement-breakpoint
@@ -73,7 +76,9 @@ CREATE TABLE `capture_sites` (
 	`status` text DEFAULT 'active' NOT NULL,
 	`created_at` integer DEFAULT (unixepoch('subsec') * 1000) NOT NULL,
 	FOREIGN KEY (`tenant_id`) REFERENCES `tenants`(`id`) ON UPDATE no action ON DELETE restrict,
-	CONSTRAINT "capture_sites_status_ck" CHECK("capture_sites"."status" IN ('active', 'paused', 'revoked'))
+	CONSTRAINT "capture_sites_status_ck" CHECK("capture_sites"."status" IN ('active', 'paused', 'revoked')),
+	CONSTRAINT "capture_sites_origins_json_ck" CHECK(json_valid("capture_sites"."allowed_origins_json")),
+	CONSTRAINT "capture_sites_channels_json_ck" CHECK(json_valid("capture_sites"."channels_json"))
 );
 --> statement-breakpoint
 CREATE UNIQUE INDEX `capture_sites_public_hash_uq` ON `capture_sites` (`public_key_hash`);--> statement-breakpoint
@@ -106,16 +111,21 @@ CREATE TABLE `consent_logs` (
 	`purpose` text NOT NULL,
 	`disclosure_version` text NOT NULL,
 	`affirmative_action` text NOT NULL,
-	`canonical_payload` text NOT NULL,
+	`canonical_payload_ciphertext` blob NOT NULL,
+	`payload_key_version` integer NOT NULL,
 	`payload_sha256` text NOT NULL,
 	`signature_hmac` text NOT NULL,
 	`signature_key_version` integer NOT NULL,
 	`prior_hash` text,
 	`idempotency_key` text NOT NULL,
 	`occurred_at` integer NOT NULL,
+	`retention_expires_at` integer NOT NULL,
 	`received_at` integer DEFAULT (unixepoch('subsec') * 1000) NOT NULL,
 	FOREIGN KEY (`tenant_id`) REFERENCES `tenants`(`id`) ON UPDATE no action ON DELETE restrict,
-	FOREIGN KEY (`tenant_id`,`capture_site_id`) REFERENCES `capture_sites`(`tenant_id`,`id`) ON UPDATE no action ON DELETE restrict
+	FOREIGN KEY (`tenant_id`,`capture_site_id`) REFERENCES `capture_sites`(`tenant_id`,`id`) ON UPDATE no action ON DELETE restrict,
+	CONSTRAINT "consent_logs_payload_key_version_ck" CHECK("consent_logs"."payload_key_version" >= 1),
+	CONSTRAINT "consent_logs_signature_key_version_ck" CHECK("consent_logs"."signature_key_version" >= 1),
+	CONSTRAINT "consent_logs_retention_ck" CHECK("consent_logs"."retention_expires_at" > "consent_logs"."received_at")
 );
 --> statement-breakpoint
 CREATE UNIQUE INDEX `consent_logs_tenant_id_id_uq` ON `consent_logs` (`tenant_id`,`id`);--> statement-breakpoint
@@ -155,7 +165,8 @@ CREATE TABLE `dns_checks` (
 	`checked_at` integer DEFAULT (unixepoch('subsec') * 1000) NOT NULL,
 	FOREIGN KEY (`tenant_id`) REFERENCES `tenants`(`id`) ON UPDATE no action ON DELETE restrict,
 	FOREIGN KEY (`tenant_id`,`domain_id`) REFERENCES `sending_domains`(`tenant_id`,`id`) ON UPDATE no action ON DELETE restrict,
-	CONSTRAINT "dns_checks_status_ck" CHECK("dns_checks"."status" IN ('healthy', 'degraded', 'blocked', 'error'))
+	CONSTRAINT "dns_checks_status_ck" CHECK("dns_checks"."status" IN ('healthy', 'degraded', 'blocked', 'error')),
+	CONSTRAINT "dns_checks_records_json_ck" CHECK(json_valid("dns_checks"."records_json"))
 );
 --> statement-breakpoint
 CREATE UNIQUE INDEX `dns_checks_tenant_id_id_uq` ON `dns_checks` (`tenant_id`,`id`);--> statement-breakpoint
@@ -192,7 +203,9 @@ CREATE TABLE `inbound_messages` (
 	`received_at` integer NOT NULL,
 	`created_at` integer DEFAULT (unixepoch('subsec') * 1000) NOT NULL,
 	FOREIGN KEY (`tenant_id`) REFERENCES `tenants`(`id`) ON UPDATE no action ON DELETE restrict,
-	FOREIGN KEY (`tenant_id`,`inbox_id`) REFERENCES `sending_inboxes`(`tenant_id`,`id`) ON UPDATE no action ON DELETE restrict
+	FOREIGN KEY (`tenant_id`,`inbox_id`) REFERENCES `sending_inboxes`(`tenant_id`,`id`) ON UPDATE no action ON DELETE restrict,
+	CONSTRAINT "inbound_messages_references_json_ck" CHECK(json_valid("inbound_messages"."references_json")),
+	CONSTRAINT "inbound_messages_headers_json_ck" CHECK(json_valid("inbound_messages"."headers_json"))
 );
 --> statement-breakpoint
 CREATE UNIQUE INDEX `inbound_messages_tenant_id_id_uq` ON `inbound_messages` (`tenant_id`,`id`);--> statement-breakpoint
@@ -234,6 +247,7 @@ CREATE TABLE `leads` (
 --> statement-breakpoint
 CREATE UNIQUE INDEX `leads_tenant_id_id_uq` ON `leads` (`tenant_id`,`id`);--> statement-breakpoint
 CREATE UNIQUE INDEX `leads_tenant_email_uq` ON `leads` (`tenant_id`,`normalized_email`);--> statement-breakpoint
+CREATE UNIQUE INDEX `leads_tenant_phone_uq` ON `leads` (`tenant_id`,`normalized_phone`);--> statement-breakpoint
 CREATE INDEX `leads_tenant_status_idx` ON `leads` (`tenant_id`,`status`);--> statement-breakpoint
 CREATE TABLE `notifications` (
 	`id` text PRIMARY KEY NOT NULL,
@@ -247,7 +261,8 @@ CREATE TABLE `notifications` (
 	`created_at` integer DEFAULT (unixepoch('subsec') * 1000) NOT NULL,
 	FOREIGN KEY (`tenant_id`) REFERENCES `tenants`(`id`) ON UPDATE no action ON DELETE restrict,
 	CONSTRAINT "notifications_status_ck" CHECK("notifications"."status" IN ('pending', 'sent', 'failed')),
-	CONSTRAINT "notifications_attempts_ck" CHECK("notifications"."attempts" >= 0)
+	CONSTRAINT "notifications_attempts_ck" CHECK("notifications"."attempts" >= 0),
+	CONSTRAINT "notifications_payload_json_ck" CHECK(json_valid("notifications"."payload_json"))
 );
 --> statement-breakpoint
 CREATE UNIQUE INDEX `notifications_tenant_id_id_uq` ON `notifications` (`tenant_id`,`id`);--> statement-breakpoint
@@ -268,10 +283,11 @@ CREATE TABLE `outbound_messages` (
 	`sent_at` integer,
 	`created_at` integer DEFAULT (unixepoch('subsec') * 1000) NOT NULL,
 	FOREIGN KEY (`tenant_id`) REFERENCES `tenants`(`id`) ON UPDATE no action ON DELETE restrict,
-	FOREIGN KEY (`tenant_id`,`job_id`) REFERENCES `send_jobs`(`tenant_id`,`id`) ON UPDATE no action ON DELETE restrict,
+	FOREIGN KEY (`tenant_id`,`job_id`,`lead_id`,`inbox_id`) REFERENCES `send_jobs`(`tenant_id`,`id`,`lead_id`,`inbox_id`) ON UPDATE no action ON DELETE restrict,
 	FOREIGN KEY (`tenant_id`,`lead_id`) REFERENCES `leads`(`tenant_id`,`id`) ON UPDATE no action ON DELETE restrict,
 	FOREIGN KEY (`tenant_id`,`inbox_id`) REFERENCES `sending_inboxes`(`tenant_id`,`id`) ON UPDATE no action ON DELETE restrict,
-	CONSTRAINT "outbound_messages_status_ck" CHECK("outbound_messages"."status" IN ('prepared', 'accepted', 'rejected', 'unknown'))
+	CONSTRAINT "outbound_messages_status_ck" CHECK("outbound_messages"."status" IN ('prepared', 'accepted', 'rejected', 'unknown')),
+	CONSTRAINT "outbound_messages_headers_json_ck" CHECK(json_valid("outbound_messages"."headers_json"))
 );
 --> statement-breakpoint
 CREATE UNIQUE INDEX `outbound_messages_tenant_id_id_uq` ON `outbound_messages` (`tenant_id`,`id`);--> statement-breakpoint
@@ -314,6 +330,8 @@ CREATE TABLE `send_jobs` (
 	`id` text PRIMARY KEY NOT NULL,
 	`tenant_id` text NOT NULL,
 	`enrollment_id` text NOT NULL,
+	`campaign_id` text NOT NULL,
+	`lead_id` text NOT NULL,
 	`step_id` text NOT NULL,
 	`inbox_id` text,
 	`unsubscribe_token_id` text,
@@ -329,17 +347,19 @@ CREATE TABLE `send_jobs` (
 	`created_at` integer DEFAULT (unixepoch('subsec') * 1000) NOT NULL,
 	`updated_at` integer DEFAULT (unixepoch('subsec') * 1000) NOT NULL,
 	FOREIGN KEY (`tenant_id`) REFERENCES `tenants`(`id`) ON UPDATE no action ON DELETE restrict,
-	FOREIGN KEY (`tenant_id`,`enrollment_id`) REFERENCES `campaign_enrollments`(`tenant_id`,`id`) ON UPDATE no action ON DELETE restrict,
-	FOREIGN KEY (`tenant_id`,`step_id`) REFERENCES `sequence_steps`(`tenant_id`,`id`) ON UPDATE no action ON DELETE restrict,
+	FOREIGN KEY (`tenant_id`,`enrollment_id`,`campaign_id`,`lead_id`) REFERENCES `campaign_enrollments`(`tenant_id`,`id`,`campaign_id`,`lead_id`) ON UPDATE no action ON DELETE restrict,
+	FOREIGN KEY (`tenant_id`,`step_id`,`campaign_id`) REFERENCES `sequence_steps`(`tenant_id`,`id`,`campaign_id`) ON UPDATE no action ON DELETE restrict,
 	FOREIGN KEY (`tenant_id`,`inbox_id`) REFERENCES `sending_inboxes`(`tenant_id`,`id`) ON UPDATE no action ON DELETE restrict,
-	FOREIGN KEY (`tenant_id`,`unsubscribe_token_id`) REFERENCES `unsubscribe_tokens`(`tenant_id`,`id`) ON UPDATE no action ON DELETE restrict,
+	FOREIGN KEY (`tenant_id`,`unsubscribe_token_id`,`lead_id`) REFERENCES `unsubscribe_tokens`(`tenant_id`,`id`,`lead_id`) ON UPDATE no action ON DELETE restrict,
 	CONSTRAINT "send_jobs_status_ck" CHECK("send_jobs"."status" IN ('queued', 'leased', 'sending', 'sent', 'failed', 'unknown', 'cancelled')),
 	CONSTRAINT "send_jobs_attempt_count_ck" CHECK("send_jobs"."attempt_count" >= 0)
 );
 --> statement-breakpoint
 CREATE UNIQUE INDEX `send_jobs_tenant_id_id_uq` ON `send_jobs` (`tenant_id`,`id`);--> statement-breakpoint
+CREATE UNIQUE INDEX `send_jobs_delivery_identity_uq` ON `send_jobs` (`tenant_id`,`id`,`lead_id`,`inbox_id`);--> statement-breakpoint
 CREATE UNIQUE INDEX `send_jobs_enrollment_step_uq` ON `send_jobs` (`tenant_id`,`enrollment_id`,`step_id`);--> statement-breakpoint
-CREATE INDEX `send_jobs_due_idx` ON `send_jobs` (`status`,`due_at`,`lease_expires_at`);--> statement-breakpoint
+CREATE INDEX `send_jobs_queued_due_idx` ON `send_jobs` (`due_at`) WHERE "send_jobs"."status" = 'queued';--> statement-breakpoint
+CREATE INDEX `send_jobs_expired_lease_idx` ON `send_jobs` (`lease_expires_at`) WHERE "send_jobs"."status" = 'leased';--> statement-breakpoint
 CREATE TABLE `sending_domains` (
 	`id` text PRIMARY KEY NOT NULL,
 	`tenant_id` text NOT NULL,
@@ -408,6 +428,7 @@ CREATE TABLE `sequence_steps` (
 );
 --> statement-breakpoint
 CREATE UNIQUE INDEX `sequence_steps_tenant_id_id_uq` ON `sequence_steps` (`tenant_id`,`id`);--> statement-breakpoint
+CREATE UNIQUE INDEX `sequence_steps_campaign_identity_uq` ON `sequence_steps` (`tenant_id`,`id`,`campaign_id`);--> statement-breakpoint
 CREATE UNIQUE INDEX `sequence_steps_campaign_order_uq` ON `sequence_steps` (`tenant_id`,`campaign_id`,`step_order`);--> statement-breakpoint
 CREATE TABLE `suppression_events` (
 	`id` text PRIMARY KEY NOT NULL,
@@ -419,7 +440,8 @@ CREATE TABLE `suppression_events` (
 	`created_at` integer DEFAULT (unixepoch('subsec') * 1000) NOT NULL,
 	FOREIGN KEY (`tenant_id`) REFERENCES `tenants`(`id`) ON UPDATE no action ON DELETE restrict,
 	FOREIGN KEY (`tenant_id`,`suppression_id`) REFERENCES `suppressions`(`tenant_id`,`id`) ON UPDATE no action ON DELETE restrict,
-	CONSTRAINT "suppression_events_action_ck" CHECK("suppression_events"."action" IN ('added', 'confirmed', 'imported'))
+	CONSTRAINT "suppression_events_action_ck" CHECK("suppression_events"."action" IN ('added', 'confirmed', 'imported')),
+	CONSTRAINT "suppression_events_metadata_json_ck" CHECK(json_valid("suppression_events"."metadata_json"))
 );
 --> statement-breakpoint
 CREATE UNIQUE INDEX `suppression_events_tenant_id_id_uq` ON `suppression_events` (`tenant_id`,`id`);--> statement-breakpoint
@@ -445,12 +467,15 @@ CREATE TABLE `tenant_api_keys` (
 	`tenant_id` text NOT NULL,
 	`prefix` text NOT NULL,
 	`key_hash` text NOT NULL,
+	`hash_key_version` integer DEFAULT 1 NOT NULL,
 	`scopes_json` text DEFAULT '[]' NOT NULL,
 	`expires_at` integer,
 	`revoked_at` integer,
 	`last_used_at` integer,
 	`created_at` integer DEFAULT (unixepoch('subsec') * 1000) NOT NULL,
-	FOREIGN KEY (`tenant_id`) REFERENCES `tenants`(`id`) ON UPDATE no action ON DELETE restrict
+	FOREIGN KEY (`tenant_id`) REFERENCES `tenants`(`id`) ON UPDATE no action ON DELETE restrict,
+	CONSTRAINT "tenant_api_keys_hash_key_version_ck" CHECK("tenant_api_keys"."hash_key_version" >= 1),
+	CONSTRAINT "tenant_api_keys_scopes_json_ck" CHECK(json_valid("tenant_api_keys"."scopes_json"))
 );
 --> statement-breakpoint
 CREATE UNIQUE INDEX `tenant_api_keys_prefix_uq` ON `tenant_api_keys` (`prefix`);--> statement-breakpoint
@@ -474,7 +499,6 @@ CREATE TABLE `tenants` (
 );
 --> statement-breakpoint
 CREATE UNIQUE INDEX `tenants_slug_uq` ON `tenants` (`slug`);--> statement-breakpoint
-CREATE UNIQUE INDEX `tenants_id_id_uq` ON `tenants` (`id`,`id`);--> statement-breakpoint
 CREATE TABLE `unsubscribe_tokens` (
 	`id` text PRIMARY KEY NOT NULL,
 	`tenant_id` text NOT NULL,
@@ -490,6 +514,7 @@ CREATE TABLE `unsubscribe_tokens` (
 --> statement-breakpoint
 CREATE UNIQUE INDEX `unsubscribe_tokens_hash_uq` ON `unsubscribe_tokens` (`token_hash`);--> statement-breakpoint
 CREATE UNIQUE INDEX `unsubscribe_tokens_tenant_id_id_uq` ON `unsubscribe_tokens` (`tenant_id`,`id`);--> statement-breakpoint
+CREATE UNIQUE INDEX `unsubscribe_tokens_lead_identity_uq` ON `unsubscribe_tokens` (`tenant_id`,`id`,`lead_id`);--> statement-breakpoint
 CREATE INDEX `unsubscribe_tokens_expiry_idx` ON `unsubscribe_tokens` (`tenant_id`,`expires_at`,`revoked_at`);--> statement-breakpoint
 CREATE TABLE `worker_runs` (
 	`id` text PRIMARY KEY NOT NULL,
@@ -504,7 +529,8 @@ CREATE TABLE `worker_runs` (
 	`finished_at` integer,
 	FOREIGN KEY (`tenant_id`) REFERENCES `tenants`(`id`) ON UPDATE no action ON DELETE restrict,
 	CONSTRAINT "worker_runs_type_ck" CHECK("worker_runs"."run_type" IN ('dispatch', 'poll_inboxes', 'dns')),
-	CONSTRAINT "worker_runs_status_ck" CHECK("worker_runs"."status" IN ('running', 'completed', 'failed'))
+	CONSTRAINT "worker_runs_status_ck" CHECK("worker_runs"."status" IN ('running', 'completed', 'failed')),
+	CONSTRAINT "worker_runs_stats_json_ck" CHECK(json_valid("worker_runs"."stats_json"))
 );
 --> statement-breakpoint
 CREATE UNIQUE INDEX `worker_runs_tenant_id_id_uq` ON `worker_runs` (`tenant_id`,`id`);--> statement-breakpoint
@@ -512,10 +538,10 @@ CREATE UNIQUE INDEX `worker_runs_bucket_uq` ON `worker_runs` (`tenant_id`,`run_t
 CREATE TRIGGER `consent_logs_immutable_update`
 BEFORE UPDATE ON `consent_logs`
 BEGIN
-	SELECT RAISE(ABORT, 'consent evidence is immutable');
+	SELECT RAISE(ABORT, 'consent_logs are immutable');
 END;--> statement-breakpoint
 CREATE TRIGGER `consent_logs_immutable_delete`
 BEFORE DELETE ON `consent_logs`
 BEGIN
-	SELECT RAISE(ABORT, 'consent evidence is immutable');
+	SELECT RAISE(ABORT, 'consent_logs are immutable');
 END;

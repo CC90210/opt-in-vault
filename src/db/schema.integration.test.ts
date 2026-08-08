@@ -1,4 +1,4 @@
-import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { createClient, type Client } from "@libsql/client";
 import { drizzle } from "drizzle-orm/libsql";
@@ -47,6 +47,10 @@ const NON_CASCADING_EVIDENCE_TABLES = [
   "audit_events",
 ] as const;
 
+const MIGRATIONS_FOLDER = fileURLToPath(
+  new URL("../../drizzle", import.meta.url),
+);
+
 describe("database schema migration", () => {
   let client: Client;
 
@@ -54,7 +58,7 @@ describe("database schema migration", () => {
     client = createClient({ url: "file::memory:" });
 
     await migrate(drizzle(client), {
-      migrationsFolder: join(process.cwd(), "drizzle"),
+      migrationsFolder: MIGRATIONS_FOLDER,
     });
     await client.execute("PRAGMA foreign_keys = ON");
   });
@@ -64,12 +68,21 @@ describe("database schema migration", () => {
   });
 
   it("executes the checked-in migration and creates every required table", async () => {
+    await migrate(drizzle(client), { migrationsFolder: MIGRATIONS_FOLDER });
     const result = await client.execute(
       "SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name",
     );
     const names = result.rows.map((row) => String(row.name));
 
     expect(names).toEqual(expect.arrayContaining([...REQUIRED_TABLES]));
+    const migrations = await client.execute(
+      "SELECT COUNT(*) AS count FROM __drizzle_migrations",
+    );
+    const triggers = await client.execute(
+      "SELECT COUNT(*) AS count FROM sqlite_schema WHERE type = 'trigger' AND name LIKE 'consent_logs_immutable_%'",
+    );
+    expect(Number(migrations.rows[0]?.count)).toBe(1);
+    expect(Number(triggers.rows[0]?.count)).toBe(2);
   });
 
   it("enables foreign keys and leaves a clean foreign-key check", async () => {
@@ -108,12 +121,12 @@ describe("database schema migration", () => {
       "INSERT INTO tenants (id, slug, name) VALUES ('tenant-a', 'tenant-a', 'Tenant A')",
     );
     await client.execute(
-      "INSERT INTO consent_logs (id, tenant_id, subject_identifier_hash, controller, purpose, disclosure_version, affirmative_action, canonical_payload, payload_sha256, signature_hmac, signature_key_version, idempotency_key, occurred_at) VALUES ('consent-a', 'tenant-a', 'subject-hash', 'Controller', 'Updates', 'v1', 'submit', '{}', 'payload-hash', 'signature', 1, 'idem-a', 1000)",
+      "INSERT INTO consent_logs (id, tenant_id, subject_identifier_hash, controller, purpose, disclosure_version, affirmative_action, canonical_payload_ciphertext, payload_key_version, payload_sha256, signature_hmac, signature_key_version, idempotency_key, occurred_at, received_at, retention_expires_at) VALUES ('consent-a', 'tenant-a', 'subject-hash', 'Controller', 'Updates', 'v1', 'submit', X'01', 1, 'payload-hash', 'signature', 1, 'idem-a', 1000, 1000, 2000)",
     );
 
     await expect(
       client.execute(
-        "UPDATE consent_logs SET canonical_payload = '{\"changed\":true}' WHERE id = 'consent-a'",
+        "UPDATE consent_logs SET canonical_payload_ciphertext = X'02' WHERE id = 'consent-a'",
       ),
     ).rejects.toThrow(/immutable/i);
     await expect(
@@ -181,15 +194,53 @@ describe("database schema migration", () => {
 
   it("creates the indexes used to claim due work", async () => {
     const result = await client.execute(
-      "SELECT name FROM sqlite_schema WHERE type = 'index' AND name IN ('send_jobs_due_idx', 'campaign_enrollments_due_idx', 'notifications_due_idx', 'unsubscribe_tokens_expiry_idx') ORDER BY name",
+      "SELECT name FROM sqlite_schema WHERE type = 'index' AND name IN ('send_jobs_queued_due_idx', 'send_jobs_expired_lease_idx', 'campaign_enrollments_due_idx', 'notifications_due_idx', 'unsubscribe_tokens_expiry_idx') ORDER BY name",
     );
 
     expect(result.rows.map((row) => row.name)).toEqual([
       "campaign_enrollments_due_idx",
       "notifications_due_idx",
-      "send_jobs_due_idx",
+      "send_jobs_expired_lease_idx",
+      "send_jobs_queued_due_idx",
       "unsubscribe_tokens_expiry_idx",
     ]);
+
+    const queuedPlan = await client.execute(
+      "EXPLAIN QUERY PLAN SELECT id FROM send_jobs WHERE status = 'queued' AND due_at <= 1000 ORDER BY due_at LIMIT 10",
+    );
+    const leasePlan = await client.execute(
+      "EXPLAIN QUERY PLAN SELECT id FROM send_jobs WHERE status = 'leased' AND lease_expires_at <= 1000 ORDER BY lease_expires_at LIMIT 10",
+    );
+    expect(JSON.stringify(queuedPlan.rows)).toContain("send_jobs_queued_due_idx");
+    expect(JSON.stringify(leasePlan.rows)).toContain("send_jobs_expired_lease_idx");
+  });
+
+  it("rejects same-tenant cross-wiring between enrollments, steps, leads, and tokens", async () => {
+    await client.batch(
+      [
+        "INSERT INTO tenants (id, slug, name) VALUES ('tenant-a', 'tenant-a', 'Tenant A')",
+        "INSERT INTO campaigns (id, tenant_id, name) VALUES ('campaign-a', 'tenant-a', 'A')",
+        "INSERT INTO campaigns (id, tenant_id, name) VALUES ('campaign-b', 'tenant-a', 'B')",
+        "INSERT INTO sequence_steps (id, tenant_id, campaign_id, step_order, subject_template, body_template) VALUES ('step-a', 'tenant-a', 'campaign-a', 1, 'Hi', 'Body')",
+        "INSERT INTO sequence_steps (id, tenant_id, campaign_id, step_order, subject_template, body_template) VALUES ('step-b', 'tenant-a', 'campaign-b', 1, 'Hi', 'Body')",
+        "INSERT INTO leads (id, tenant_id, email_address, normalized_email) VALUES ('lead-a', 'tenant-a', 'a@example.com', 'a@example.com')",
+        "INSERT INTO leads (id, tenant_id, email_address, normalized_email) VALUES ('lead-b', 'tenant-a', 'b@example.com', 'b@example.com')",
+        "INSERT INTO campaign_enrollments (id, tenant_id, campaign_id, lead_id) VALUES ('enrollment-a', 'tenant-a', 'campaign-a', 'lead-a')",
+        "INSERT INTO unsubscribe_tokens (id, tenant_id, lead_id, token_hash) VALUES ('token-b', 'tenant-a', 'lead-b', 'hash-b')",
+      ],
+      "write",
+    );
+
+    await expect(
+      client.execute(
+        "INSERT INTO send_jobs (id, tenant_id, enrollment_id, campaign_id, lead_id, step_id, unsubscribe_token_id, due_at) VALUES ('job-wrong-step', 'tenant-a', 'enrollment-a', 'campaign-a', 'lead-a', 'step-b', NULL, 0)",
+      ),
+    ).rejects.toThrow(/foreign key/i);
+    await expect(
+      client.execute(
+        "INSERT INTO send_jobs (id, tenant_id, enrollment_id, campaign_id, lead_id, step_id, unsubscribe_token_id, due_at) VALUES ('job-wrong-token', 'tenant-a', 'enrollment-a', 'campaign-a', 'lead-a', 'step-a', 'token-b', 0)",
+      ),
+    ).rejects.toThrow(/foreign key/i);
   });
 
   it("never cascades tenant deletion into evidence, delivery, suppression, or audit records", async () => {

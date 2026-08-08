@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "2c045942-2581-4b94-a06b-cbdb6f9c6f6c",
+  "id": "e789544c-24a6-4e0c-aa4d-3ac2d57cec99",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "tables": {
     "audit_events": {
@@ -110,7 +110,12 @@
       },
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
-      "checkConstraints": {}
+      "checkConstraints": {
+        "audit_events_metadata_json_ck": {
+          "name": "audit_events_metadata_json_ck",
+          "value": "json_valid(\"audit_events\".\"metadata_json\")"
+        }
+      }
     },
     "campaign_enrollments": {
       "name": "campaign_enrollments",
@@ -203,6 +208,16 @@
           "columns": [
             "tenant_id",
             "id"
+          ],
+          "isUnique": true
+        },
+        "campaign_enrollments_identity_uq": {
+          "name": "campaign_enrollments_identity_uq",
+          "columns": [
+            "tenant_id",
+            "id",
+            "campaign_id",
+            "lead_id"
           ],
           "isUnique": true
         },
@@ -444,6 +459,10 @@
         "campaigns_jitter_max_ck": {
           "name": "campaigns_jitter_max_ck",
           "value": "\"campaigns\".\"jitter_max_seconds\" >= \"campaigns\".\"jitter_min_seconds\" AND \"campaigns\".\"jitter_max_seconds\" <= 3600"
+        },
+        "campaigns_schedule_json_ck": {
+          "name": "campaigns_schedule_json_ck",
+          "value": "json_valid(\"campaigns\".\"schedule_json\")"
         }
       }
     },
@@ -599,6 +618,14 @@
         "capture_sites_status_ck": {
           "name": "capture_sites_status_ck",
           "value": "\"capture_sites\".\"status\" IN ('active', 'paused', 'revoked')"
+        },
+        "capture_sites_origins_json_ck": {
+          "name": "capture_sites_origins_json_ck",
+          "value": "json_valid(\"capture_sites\".\"allowed_origins_json\")"
+        },
+        "capture_sites_channels_json_ck": {
+          "name": "capture_sites_channels_json_ck",
+          "value": "json_valid(\"capture_sites\".\"channels_json\")"
         }
       }
     },
@@ -794,9 +821,16 @@
           "notNull": true,
           "autoincrement": false
         },
-        "canonical_payload": {
-          "name": "canonical_payload",
-          "type": "text",
+        "canonical_payload_ciphertext": {
+          "name": "canonical_payload_ciphertext",
+          "type": "blob",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "payload_key_version": {
+          "name": "payload_key_version",
+          "type": "integer",
           "primaryKey": false,
           "notNull": true,
           "autoincrement": false
@@ -838,6 +872,13 @@
         },
         "occurred_at": {
           "name": "occurred_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "retention_expires_at": {
+          "name": "retention_expires_at",
           "type": "integer",
           "primaryKey": false,
           "notNull": true,
@@ -911,7 +952,20 @@
       },
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
-      "checkConstraints": {}
+      "checkConstraints": {
+        "consent_logs_payload_key_version_ck": {
+          "name": "consent_logs_payload_key_version_ck",
+          "value": "\"consent_logs\".\"payload_key_version\" >= 1"
+        },
+        "consent_logs_signature_key_version_ck": {
+          "name": "consent_logs_signature_key_version_ck",
+          "value": "\"consent_logs\".\"signature_key_version\" >= 1"
+        },
+        "consent_logs_retention_ck": {
+          "name": "consent_logs_retention_ck",
+          "value": "\"consent_logs\".\"retention_expires_at\" > \"consent_logs\".\"received_at\""
+        }
+      }
     },
     "delivery_attempts": {
       "name": "delivery_attempts",
@@ -1208,6 +1262,10 @@
         "dns_checks_status_ck": {
           "name": "dns_checks_status_ck",
           "value": "\"dns_checks\".\"status\" IN ('healthy', 'degraded', 'blocked', 'error')"
+        },
+        "dns_checks_records_json_ck": {
+          "name": "dns_checks_records_json_ck",
+          "value": "json_valid(\"dns_checks\".\"records_json\")"
         }
       }
     },
@@ -1499,7 +1557,16 @@
       },
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
-      "checkConstraints": {}
+      "checkConstraints": {
+        "inbound_messages_references_json_ck": {
+          "name": "inbound_messages_references_json_ck",
+          "value": "json_valid(\"inbound_messages\".\"references_json\")"
+        },
+        "inbound_messages_headers_json_ck": {
+          "name": "inbound_messages_headers_json_ck",
+          "value": "json_valid(\"inbound_messages\".\"headers_json\")"
+        }
+      }
     },
     "inbox_daily_usage": {
       "name": "inbox_daily_usage",
@@ -1732,6 +1799,14 @@
           ],
           "isUnique": true
         },
+        "leads_tenant_phone_uq": {
+          "name": "leads_tenant_phone_uq",
+          "columns": [
+            "tenant_id",
+            "normalized_phone"
+          ],
+          "isUnique": true
+        },
         "leads_tenant_status_idx": {
           "name": "leads_tenant_status_idx",
           "columns": [
@@ -1879,6 +1954,10 @@
         "notifications_attempts_ck": {
           "name": "notifications_attempts_ck",
           "value": "\"notifications\".\"attempts\" >= 0"
+        },
+        "notifications_payload_json_ck": {
+          "name": "notifications_payload_json_ck",
+          "value": "json_valid(\"notifications\".\"payload_json\")"
         }
       }
     },
@@ -2031,11 +2110,15 @@
           "tableTo": "send_jobs",
           "columnsFrom": [
             "tenant_id",
-            "job_id"
+            "job_id",
+            "lead_id",
+            "inbox_id"
           ],
           "columnsTo": [
             "tenant_id",
-            "id"
+            "id",
+            "lead_id",
+            "inbox_id"
           ],
           "onDelete": "restrict",
           "onUpdate": "no action"
@@ -2077,6 +2160,10 @@
         "outbound_messages_status_ck": {
           "name": "outbound_messages_status_ck",
           "value": "\"outbound_messages\".\"status\" IN ('prepared', 'accepted', 'rejected', 'unknown')"
+        },
+        "outbound_messages_headers_json_ck": {
+          "name": "outbound_messages_headers_json_ck",
+          "value": "json_valid(\"outbound_messages\".\"headers_json\")"
         }
       }
     },
@@ -2357,6 +2444,20 @@
           "notNull": true,
           "autoincrement": false
         },
+        "campaign_id": {
+          "name": "campaign_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "lead_id": {
+          "name": "lead_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
         "step_id": {
           "name": "step_id",
           "type": "text",
@@ -2469,6 +2570,16 @@
           ],
           "isUnique": true
         },
+        "send_jobs_delivery_identity_uq": {
+          "name": "send_jobs_delivery_identity_uq",
+          "columns": [
+            "tenant_id",
+            "id",
+            "lead_id",
+            "inbox_id"
+          ],
+          "isUnique": true
+        },
         "send_jobs_enrollment_step_uq": {
           "name": "send_jobs_enrollment_step_uq",
           "columns": [
@@ -2478,14 +2589,21 @@
           ],
           "isUnique": true
         },
-        "send_jobs_due_idx": {
-          "name": "send_jobs_due_idx",
+        "send_jobs_queued_due_idx": {
+          "name": "send_jobs_queued_due_idx",
           "columns": [
-            "status",
-            "due_at",
+            "due_at"
+          ],
+          "isUnique": false,
+          "where": "\"send_jobs\".\"status\" = 'queued'"
+        },
+        "send_jobs_expired_lease_idx": {
+          "name": "send_jobs_expired_lease_idx",
+          "columns": [
             "lease_expires_at"
           ],
-          "isUnique": false
+          "isUnique": false,
+          "where": "\"send_jobs\".\"status\" = 'leased'"
         }
       },
       "foreignKeys": {
@@ -2508,11 +2626,15 @@
           "tableTo": "campaign_enrollments",
           "columnsFrom": [
             "tenant_id",
-            "enrollment_id"
+            "enrollment_id",
+            "campaign_id",
+            "lead_id"
           ],
           "columnsTo": [
             "tenant_id",
-            "id"
+            "id",
+            "campaign_id",
+            "lead_id"
           ],
           "onDelete": "restrict",
           "onUpdate": "no action"
@@ -2523,11 +2645,13 @@
           "tableTo": "sequence_steps",
           "columnsFrom": [
             "tenant_id",
-            "step_id"
+            "step_id",
+            "campaign_id"
           ],
           "columnsTo": [
             "tenant_id",
-            "id"
+            "id",
+            "campaign_id"
           ],
           "onDelete": "restrict",
           "onUpdate": "no action"
@@ -2553,11 +2677,13 @@
           "tableTo": "unsubscribe_tokens",
           "columnsFrom": [
             "tenant_id",
-            "unsubscribe_token_id"
+            "unsubscribe_token_id",
+            "lead_id"
           ],
           "columnsTo": [
             "tenant_id",
-            "id"
+            "id",
+            "lead_id"
           ],
           "onDelete": "restrict",
           "onUpdate": "no action"
@@ -3018,6 +3144,15 @@
           ],
           "isUnique": true
         },
+        "sequence_steps_campaign_identity_uq": {
+          "name": "sequence_steps_campaign_identity_uq",
+          "columns": [
+            "tenant_id",
+            "id",
+            "campaign_id"
+          ],
+          "isUnique": true
+        },
         "sequence_steps_campaign_order_uq": {
           "name": "sequence_steps_campaign_order_uq",
           "columns": [
@@ -3181,6 +3316,10 @@
         "suppression_events_action_ck": {
           "name": "suppression_events_action_ck",
           "value": "\"suppression_events\".\"action\" IN ('added', 'confirmed', 'imported')"
+        },
+        "suppression_events_metadata_json_ck": {
+          "name": "suppression_events_metadata_json_ck",
+          "value": "json_valid(\"suppression_events\".\"metadata_json\")"
         }
       }
     },
@@ -3329,6 +3468,14 @@
           "notNull": true,
           "autoincrement": false
         },
+        "hash_key_version": {
+          "name": "hash_key_version",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 1
+        },
         "scopes_json": {
           "name": "scopes_json",
           "type": "text",
@@ -3416,7 +3563,16 @@
       },
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
-      "checkConstraints": {}
+      "checkConstraints": {
+        "tenant_api_keys_hash_key_version_ck": {
+          "name": "tenant_api_keys_hash_key_version_ck",
+          "value": "\"tenant_api_keys\".\"hash_key_version\" >= 1"
+        },
+        "tenant_api_keys_scopes_json_ck": {
+          "name": "tenant_api_keys_scopes_json_ck",
+          "value": "json_valid(\"tenant_api_keys\".\"scopes_json\")"
+        }
+      }
     },
     "tenants": {
       "name": "tenants",
@@ -3511,14 +3667,6 @@
             "slug"
           ],
           "isUnique": true
-        },
-        "tenants_id_id_uq": {
-          "name": "tenants_id_id_uq",
-          "columns": [
-            "id",
-            "id"
-          ],
-          "isUnique": true
         }
       },
       "foreignKeys": {},
@@ -3609,6 +3757,15 @@
           "columns": [
             "tenant_id",
             "id"
+          ],
+          "isUnique": true
+        },
+        "unsubscribe_tokens_lead_identity_uq": {
+          "name": "unsubscribe_tokens_lead_identity_uq",
+          "columns": [
+            "tenant_id",
+            "id",
+            "lead_id"
           ],
           "isUnique": true
         },
@@ -3777,6 +3934,10 @@
         "worker_runs_status_ck": {
           "name": "worker_runs_status_ck",
           "value": "\"worker_runs\".\"status\" IN ('running', 'completed', 'failed')"
+        },
+        "worker_runs_stats_json_ck": {
+          "name": "worker_runs_stats_json_ck",
+          "value": "json_valid(\"worker_runs\".\"stats_json\")"
         }
       }
     }
