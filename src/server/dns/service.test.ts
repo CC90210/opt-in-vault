@@ -70,6 +70,11 @@ describe("sending domain DNS service", () => {
     });
     expect(JSON.parse(String(stored.rows[0]?.records_json))).toMatchObject({
       alignment: "records_present_not_message_verified",
+      source: {
+        sendingDomain: "example.com",
+        dkimSelector: "selector",
+        dkimMode: "provider",
+      },
     });
   });
 

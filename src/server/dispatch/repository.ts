@@ -9,8 +9,10 @@ import type {
   Transaction,
 } from "@libsql/client";
 
+import { DNS_FRESHNESS_MS } from "@/server/dns/freshness";
+
 export const DISPATCH_SEND_DEADLINE_MS = 90_000;
-export const DNS_FRESHNESS_MS = 24 * 60 * 60 * 1_000;
+export { DNS_FRESHNESS_MS };
 
 const DEFAULT_LEASE_DURATION_MS = 120_000;
 const SEND_LEASE_GRACE_MS = 5_000;
@@ -64,6 +66,11 @@ export type DispatchContext = {
   sendingDomain: string;
   domainStatus: string;
   domainLastDnsCheckAt: number | null;
+  domainDnsCheckAt: number | null;
+  domainDnsCheckStatus: string | null;
+  domainDnsCheckDkimStatus: string | null;
+  domainDnsCheckErrorCode: string | null;
+  domainDnsCheckRecordsJson: string | null;
   dkimSelector: string | null;
   dkimMode: "provider" | "local";
   normalizedEmail: string;
@@ -323,6 +330,11 @@ async function loadContextFrom(
         domain.domain AS sending_domain,
         domain.status AS domain_status,
         domain.last_dns_check_at AS domain_last_dns_check_at,
+        dns_check.checked_at AS domain_dns_check_at,
+        dns_check.status AS domain_dns_check_status,
+        dns_check.dkim_status AS domain_dns_check_dkim_status,
+        dns_check.error_code AS domain_dns_check_error_code,
+        dns_check.records_json AS domain_dns_check_records_json,
         domain.dkim_selector,
         domain.dkim_mode
       FROM send_jobs AS job
@@ -350,6 +362,25 @@ async function loadContextFrom(
       JOIN sending_domains AS domain
         ON domain.tenant_id = inbox.tenant_id
        AND domain.id = inbox.domain_id
+      LEFT JOIN dns_checks AS dns_check
+        ON dns_check.tenant_id = domain.tenant_id
+       AND dns_check.domain_id = domain.id
+       AND 1 = (
+         SELECT COUNT(*)
+         FROM dns_checks AS exact_check
+         WHERE exact_check.tenant_id = domain.tenant_id
+           AND exact_check.domain_id = domain.id
+           AND exact_check.checked_at = domain.last_dns_check_at
+       )
+       AND dns_check.id = (
+         SELECT candidate.id
+         FROM dns_checks AS candidate
+         WHERE candidate.tenant_id = domain.tenant_id
+           AND candidate.domain_id = domain.id
+           AND candidate.checked_at = domain.last_dns_check_at
+         ORDER BY candidate.id DESC
+         LIMIT 1
+       )
       WHERE job.id = ?
         AND job.tenant_id = ?
         AND job.status = 'leased'
@@ -407,6 +438,11 @@ async function loadContextFrom(
     sendingDomain: asString(row.sending_domain, "sending domain"),
     domainStatus: asString(row.domain_status, "domain status"),
     domainLastDnsCheckAt: nullableNumber(row.domain_last_dns_check_at),
+    domainDnsCheckAt: nullableNumber(row.domain_dns_check_at),
+    domainDnsCheckStatus: nullableString(row.domain_dns_check_status),
+    domainDnsCheckDkimStatus: nullableString(row.domain_dns_check_dkim_status),
+    domainDnsCheckErrorCode: nullableString(row.domain_dns_check_error_code),
+    domainDnsCheckRecordsJson: nullableString(row.domain_dns_check_records_json),
     dkimSelector: nullableString(row.dkim_selector),
     dkimMode: asDkimMode(row.dkim_mode),
     normalizedEmail: asString(row.normalized_email, "normalized email"),

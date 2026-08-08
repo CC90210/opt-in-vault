@@ -29,12 +29,17 @@ export async function scanSendingDomain(
   });
   const domain = domainResult.rows[0];
   if (!domain) throw new SendingDomainNotFoundError();
+  const sendingDomain = String(domain.domain).trim().replace(/\.$/, "").toLowerCase();
+  const dkimSelector =
+    domain.dkim_selector == null
+      ? null
+      : String(domain.dkim_selector).trim().toLowerCase();
+  const dkimMode = String(domain.dkim_mode) === "local" ? "local" : "provider";
   const result = await scanDnsHealth(
     {
-      domain: String(domain.domain),
-      dkimSelector:
-        domain.dkim_selector == null ? null : String(domain.dkim_selector),
-      dkimMode: String(domain.dkim_mode) === "local" ? "local" : "provider",
+      domain: sendingDomain,
+      dkimSelector,
+      dkimMode,
     },
     options.resolver,
   );
@@ -64,6 +69,11 @@ export async function scanSendingDomain(
           JSON.stringify({
             alignment: result.alignment,
             sendReady: result.sendReady,
+            source: {
+              sendingDomain,
+              dkimSelector,
+              dkimMode,
+            },
             records: result.records,
           }),
           result.errorCode,

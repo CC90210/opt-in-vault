@@ -1,3 +1,5 @@
+import { generateKeyPairSync } from "node:crypto";
+
 import { encryptSecret } from "@/server/security/encryption";
 
 import type { GatewayTransport } from "./gateway";
@@ -8,11 +10,14 @@ import {
 import { createInboxCredentialBinding } from "./inbox-credentials";
 
 const KEY = Buffer.alloc(32, 7);
-const TEST_DKIM_PRIVATE_KEY = [
-  "-----BEGIN " + "PRIVATE KEY-----",
-  "test fixture only",
-  "-----END " + "PRIVATE KEY-----",
-].join("\n");
+const TEST_DNS_CHECK_AT = Date.now();
+const TEST_DKIM_KEY_PAIR = generateKeyPairSync("rsa", { modulusLength: 1_024 });
+const TEST_DKIM_PRIVATE_KEY = TEST_DKIM_KEY_PAIR.privateKey
+  .export({ format: "pem", type: "pkcs8" })
+  .toString();
+const TEST_DKIM_PUBLIC_KEY = TEST_DKIM_KEY_PAIR.publicKey
+  .export({ format: "der", type: "spki" })
+  .toString("base64");
 
 function context(
   overrides: Partial<ConfiguredTransportContext> = {},
@@ -52,6 +57,26 @@ function context(
     credentialBinding: binding,
     fromAddress: "sender@example.com",
     sendingDomain: "example.com",
+    domainLastDnsCheckAt: TEST_DNS_CHECK_AT,
+    domainDnsCheckAt: TEST_DNS_CHECK_AT,
+    domainDnsCheckStatus: "healthy",
+    domainDnsCheckDkimStatus: "present_local_key",
+    domainDnsCheckErrorCode: null,
+    domainDnsCheckRecordsJson: JSON.stringify({
+      alignment: "records_present_not_message_verified",
+      sendReady: true,
+      source: {
+        sendingDomain: "example.com",
+        dkimSelector: "outbound",
+        dkimMode: "local",
+      },
+      records: {
+        spf: [],
+        dkim: [`v=DKIM1; k=rsa; p=${TEST_DKIM_PUBLIC_KEY}`],
+        dmarc: [],
+        mx: [],
+      },
+    }),
     dkimMode: "local",
     dkimSelector: "outbound",
     ...overrides,
@@ -81,6 +106,52 @@ describe("configured inbox transport", () => {
         }),
       }),
     );
+  });
+
+  it("rejects a DNS/private-key mismatch before OAuth refresh or transport creation", async () => {
+    const published = generateKeyPairSync("rsa", { modulusLength: 1_024 });
+    const publishedPublicKey = published.publicKey
+      .export({ format: "der", type: "spki" })
+      .toString("base64");
+    const fetchImpl = vi.fn();
+    const gatewayFactory = vi.fn();
+
+    await expect(
+      createConfiguredGatewayTransport(
+        context(
+          {
+            provider: "google",
+            smtpHost: "smtp.gmail.com",
+            imapHost: "imap.gmail.com",
+            domainDnsCheckRecordsJson: JSON.stringify({
+              source: {
+                sendingDomain: "example.com",
+                dkimSelector: "outbound",
+                dkimMode: "local",
+              },
+              records: {
+                dkim: [`v=DKIM1; k=rsa; p=${publishedPublicKey}`],
+              },
+            }),
+          },
+          {
+            password: undefined,
+            oauth2: {
+              clientId: "client-id",
+              clientSecret: "client-secret",
+              refreshToken: "refresh-token",
+            },
+          },
+        ),
+        {
+          credentialKeys: new Map([["2", KEY]]),
+          gatewayFactory,
+          fetchImpl,
+        },
+      ),
+    ).rejects.toMatchObject({ code: "local_dkim_key_mismatch" });
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(gatewayFactory).not.toHaveBeenCalled();
   });
 
   it("fails closed when the stored binding does not match the actual endpoints", async () => {

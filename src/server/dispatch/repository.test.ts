@@ -85,6 +85,73 @@ describe("dispatch repository", () => {
     );
   });
 
+  it("binds transport context only to the unique DNS snapshot at last_dns_check_at", async () => {
+    const fixture = await seedDispatchFixture(client, { dueAt: 1_000 });
+    const oldSnapshot = JSON.stringify({
+      records: { dkim: ["v=DKIM1; k=rsa; p=old"] },
+    });
+    const currentSnapshot = JSON.stringify({
+      records: { dkim: ["v=DKIM1; k=rsa; p=current"] },
+    });
+    await client.batch(
+      [
+        {
+          sql: "UPDATE sending_domains SET dkim_selector = 'outbound', dkim_mode = 'local' WHERE tenant_id = ? AND id = ?",
+          args: [fixture.tenantId, fixture.domainId],
+        },
+        {
+          sql: "INSERT INTO dns_checks (id, tenant_id, domain_id, status, spf_status, dkim_status, dmarc_status, mx_status, records_json, checked_at) VALUES (?, ?, ?, 'healthy', 'present_usable', 'present_local_key', 'present_reject', 'present', ?, 800)",
+          args: [
+            `dns-old-${fixture.jobId}`,
+            fixture.tenantId,
+            fixture.domainId,
+            oldSnapshot,
+          ],
+        },
+        {
+          sql: "INSERT INTO dns_checks (id, tenant_id, domain_id, status, spf_status, dkim_status, dmarc_status, mx_status, records_json, checked_at) VALUES (?, ?, ?, 'healthy', 'present_usable', 'present_local_key', 'present_reject', 'present', ?, 900)",
+          args: [
+            `dns-current-${fixture.jobId}`,
+            fixture.tenantId,
+            fixture.domainId,
+            currentSnapshot,
+          ],
+        },
+      ],
+      "write",
+    );
+    const repository = createDispatchRepository(client, {
+      leasePepper: LEASE_PEPPER,
+      leaseTokenFactory: () => "dns-snapshot-lease",
+    });
+    const claim = await repository.claimNext(1_000);
+
+    await expect(repository.loadContext(claim!)).resolves.toMatchObject({
+      domainLastDnsCheckAt: 900,
+      domainDnsCheckAt: 900,
+      domainDnsCheckStatus: "healthy",
+      domainDnsCheckDkimStatus: "present_local_key",
+      domainDnsCheckErrorCode: null,
+      domainDnsCheckRecordsJson: currentSnapshot,
+    });
+
+    await client.execute({
+      sql: "INSERT INTO dns_checks (id, tenant_id, domain_id, status, spf_status, dkim_status, dmarc_status, mx_status, records_json, checked_at) VALUES (?, ?, ?, 'healthy', 'present_usable', 'present_local_key', 'present_reject', 'present', ?, 900)",
+      args: [
+        `dns-ambiguous-${fixture.jobId}`,
+        fixture.tenantId,
+        fixture.domainId,
+        currentSnapshot,
+      ],
+    });
+    await expect(repository.loadContext(claim!)).resolves.toMatchObject({
+      domainDnsCheckAt: null,
+      domainDnsCheckStatus: null,
+      domainDnsCheckDkimStatus: null,
+      domainDnsCheckRecordsJson: null,
+    });
+  });
+
   it("refuses expired lease ownership and renews a live lease beyond the send deadline", async () => {
     const fixture = await seedDispatchFixture(client, { dueAt: 1_000 });
     const tokens = ["expiring-lease", "renewed-lease"];

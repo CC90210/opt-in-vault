@@ -8,6 +8,10 @@ import {
   createInboxCredentialBinding,
   parseInboxCredentialPayload,
 } from "./inbox-credentials";
+import {
+  assertLocalDkimKeyMatchesDns,
+  LocalDkimVerificationError,
+} from "./dkim-key-match";
 import type { InboxTransportConfiguration } from "./nodemailer-transport";
 import {
   assertOAuthProviderHost,
@@ -29,6 +33,12 @@ export type ConfiguredTransportContext = {
   credentialBinding: string;
   fromAddress: string;
   sendingDomain: string;
+  domainLastDnsCheckAt: number | null;
+  domainDnsCheckAt: number | null;
+  domainDnsCheckStatus: string | null;
+  domainDnsCheckDkimStatus: string | null;
+  domainDnsCheckErrorCode: string | null;
+  domainDnsCheckRecordsJson: string | null;
   dkimMode: "provider" | "local";
   dkimSelector: string | null;
 };
@@ -48,6 +58,7 @@ export async function createConfiguredGatewayTransport(
   options: {
     credentialKeys: EncryptionKeyRing;
     fetchImpl?: OAuthFetch;
+    now?: () => number;
     gatewayFactory?: (
       configuration: InboxTransportConfiguration,
     ) => Promise<GatewayTransport>;
@@ -110,6 +121,28 @@ export async function createConfiguredGatewayTransport(
     ) {
       throw new TransportConfigurationError("from_domain_mismatch");
     }
+    if (
+      !context.dkimSelector ||
+      !/^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$/.test(context.dkimSelector) ||
+      !credentials.dkimPrivateKey
+    ) {
+      throw new TransportConfigurationError("local_dkim_material_missing");
+    }
+    assertLocalDkimKeyMatchesDns({
+      privateKey: credentials.dkimPrivateKey,
+      sendingDomain,
+      dkimSelector: context.dkimSelector.toLowerCase(),
+      snapshot: {
+        domainLastDnsCheckAt: context.domainLastDnsCheckAt,
+        dnsCheckAt: context.domainDnsCheckAt,
+        dnsCheckStatus: context.domainDnsCheckStatus,
+        dnsCheckDkimStatus: context.domainDnsCheckDkimStatus,
+        dnsCheckErrorCode: context.domainDnsCheckErrorCode,
+        dnsCheckRecordsJson: context.domainDnsCheckRecordsJson,
+      },
+      now: (options.now ?? Date.now)(),
+    });
+
     let configuration: InboxTransportConfiguration;
     if (context.provider === "smtp") {
       if (!credentials.password) {
@@ -147,13 +180,6 @@ export async function createConfiguredGatewayTransport(
       };
     }
 
-    if (
-      !context.dkimSelector ||
-      !/^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$/.test(context.dkimSelector) ||
-      !credentials.dkimPrivateKey
-    ) {
-      throw new TransportConfigurationError("local_dkim_material_missing");
-    }
     configuration.dkim = {
       domainName: sendingDomain,
       keySelector: context.dkimSelector,
@@ -163,6 +189,9 @@ export async function createConfiguredGatewayTransport(
   } catch (error) {
     if (error instanceof TransportConfigurationError) throw error;
     if (error instanceof OAuthAccessTokenError) {
+      throw new TransportConfigurationError(error.code);
+    }
+    if (error instanceof LocalDkimVerificationError) {
       throw new TransportConfigurationError(error.code);
     }
     throw new TransportConfigurationError("transport_configuration_invalid");
