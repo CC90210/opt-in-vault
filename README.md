@@ -16,9 +16,9 @@ The application uses Next.js 15, React 19, Turso/libSQL, Drizzle ORM, Nodemailer
 - Local DKIM signing for live RFC 8058 delivery, with a fresh source-bound DNS snapshot and cryptographic private/public-key match; provider-managed snapshots remain blocked from live delivery because header coverage cannot be proved.
 - Durable message material, stable Message-IDs, quota reservations, suppression rechecks, and quarantine of unknown delivery outcomes.
 - RFC 8058 one-click unsubscribe with a non-mutating GET and an idempotent POST.
-- Browser JavaScript and dependency-free Python consent clients, bounded/rate-limited public capture, immutable evidence rows, verified certificate PDFs, and explicit retention deadlines.
+- Browser JavaScript and dependency-free Python consent clients, source- and site-rate-limited public capture through a verified direct-Vercel edge, immutable evidence rows, verified certificate PDFs, and explicit retention deadlines.
 
-The current MVP has no public registration, tenant bootstrap command, mailbox/campaign CRUD UI, automatic retention-key destruction job, or expired rate-limit-bucket pruning job. Trusted operators must provision tenant, API-key, capture-site, inbox, and campaign records through a controlled administrative database workflow.
+The current MVP has no public registration, tenant bootstrap command, mailbox/campaign CRUD UI, automatic retention-key destruction job, or expired rate-limit-bucket pruning job. Public consent capture currently supports only a direct Vercel deployment as its verified client-IP boundary. Trusted operators must provision tenant, API-key, capture-site, inbox, and campaign records through a controlled administrative database workflow.
 
 ## Local setup
 
@@ -38,6 +38,8 @@ LIVE_SENDS_ENABLED=false
 ```
 
 The development UI is served at `http://localhost:3000`, but `NEXT_PUBLIC_APP_URL` is the public base used in unsubscribe links. The dispatch worker requires that value to be a clean HTTPS URL even during a local dry run; replace the reserved-domain template value with an HTTPS test or production origin before running dispatch.
+
+The public consent route deliberately remains unavailable in an ordinary local or self-hosted runtime. In production, set `CONSENT_TRUSTED_EDGE_PROVIDER=vercel` and deploy directly on Vercel, which supplies `VERCEL=1` and the trusted source header. Do not set `VERCEL=1` manually or forward an unverified client-IP header. Unit/integration tests inject a test-only trusted-edge resolver instead.
 
 Apply the checked-in migration before starting the application:
 

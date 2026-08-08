@@ -53,20 +53,20 @@ Live SMTP requires both `LIVE_SENDS_ENABLED=true` and an active, approved campai
 - Rendered content and Message-ID are persisted so retries cannot silently change material.
 - A definitive rejection may retry with bounded backoff; a possibly accepted/ambiguous result becomes `unknown` and is never automatically resent.
 - RFC 8058 messages contain both required headers and a visible HTTPS unsubscribe URL.
-- Live delivery requires application-controlled local DKIM signing that covers both RFC 8058 headers. Before OAuth or SMTP construction, the dispatcher binds the exact fresh DNS snapshot to its domain/selector/mode and compares the normalized RSA public key with the public key derived from the encrypted PEM. Provider-managed DKIM remains live-blocked because the application cannot prove header coverage.
+- Live delivery requires application-controlled local DKIM signing that covers both RFC 8058 headers. Before OAuth or SMTP construction, the dispatcher binds the exact fresh DNS snapshot to its domain/selector/mode, rejects records that exclude SHA-256 or email service, and compares the normalized RSA public key with the public key derived from the encrypted PEM. Provider-managed DKIM remains live-blocked because the application cannot prove header coverage.
 - `GET /api/v1/unsubscribe` never mutates. The exact one-click form POST is idempotent and applies suppression transactionally.
 
 Setting `LIVE_SENDS_ENABLED=false` and pausing active campaigns are the immediate containment controls. They cannot retract a message already accepted by a provider.
 
 ### Consent evidence
 
-Consent capture binds an active publishable site key to an exact allowed origin, registered disclosure version, configured channel set, and form URL rule. It requires an idempotency key and rejects payloads that try to provide a tenant ID.
+Consent capture binds an active tenant and active publishable site key to an exact allowed origin, registered disclosure version, configured channel set, and form URL rule. It requires an idempotency key and rejects payloads that try to provide a tenant ID.
 
-The public route incrementally enforces a 32 KiB UTF-8 body limit even without `Content-Length`. Durable tenant/site fixed-window limiting defaults to 120 new captures per minute; completed idempotent retries use a separate 10-per-minute HMAC-keyed bucket. Limiter uncertainty fails closed before evidence persistence. Expired bucket rows are indexed but this MVP does not prune them automatically.
+The public route incrementally enforces a 32 KiB UTF-8 body limit even without `Content-Length`. Durable fixed-window limiting defaults to 25 requests per verified source per active tenant/site, 120 new captures across the tenant/site, and 10 completed retries per idempotency key, all per minute. Source and aggregate decisions are committed atomically; limiter uncertainty fails closed before evidence persistence. Bucket identities are HMACs, so raw IP, site, and idempotency values are not stored in the limiter. Expired bucket rows are indexed but this MVP does not prune them automatically.
 
 Evidence payloads are canonicalized, SHA-256 hashed, HMAC signed with a recorded key version, and encrypted with AES-256-GCM. Database triggers reject updates and deletes to `consent_logs`; corrections must be appended as new evidence.
 
-This produces **tamper-evident evidence, not a legal shield**. It does not independently establish identity, authority, disclosure sufficiency, or lawful consent. Applicable law, counsel guidance, and provider rules still apply. The default route does not trust browser-supplied forwarding headers as IP evidence.
+This produces **tamper-evident evidence, not a legal shield**. It does not independently establish identity, authority, disclosure sufficiency, or lawful consent. Applicable law, counsel guidance, and provider rules still apply. The production route trusts only one public IP in Vercel's `x-vercel-forwarded-for` header when both `CONSENT_TRUSTED_EDGE_PROVIDER=vercel` and Vercel's own `VERCEL=1` marker are present. It ignores ordinary forwarding headers and returns `source_unavailable` before site lookup or persistence when verified source evidence is unavailable.
 
 ## Key rotation and destruction
 
@@ -101,6 +101,7 @@ Important non-ring rotations:
 - Use a durable remote Turso/libSQL database for ephemeral or multi-instance deployments. A local `file:` database is for local/single-host operation only.
 - Apply migrations once before starting new application/worker code, and take a restorable database snapshot first.
 - Run the web app, dispatch scheduler, and inbox scheduler with the same compatible secret versions.
+- Deploy public consent capture directly on Vercel with `CONSENT_TRUSTED_EDGE_PROVIDER=vercel`; another hosting topology requires a separately implemented and verified trusted-edge adapter.
 - Keep `LIVE_SENDS_ENABLED=false` through migrations, key rotation, restoration, and smoke testing.
 - Restrict database and deployment access to trusted operators and retain provider/audit logs without secret values.
 

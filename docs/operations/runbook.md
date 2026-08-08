@@ -58,6 +58,7 @@ Start from `.env.example`. Values are loaded from `.env.local` by the local migr
 | Variable | Minimum/format | Purpose |
 | --- | --- | --- |
 | `CAPTURE_SITE_KEY_PEPPER` | 32 bytes | Hashes publishable capture-site keys. |
+| `CONSENT_TRUSTED_EDGE_PROVIDER` | Exact value `vercel` | Enables the only implemented production source resolver. It additionally requires Vercel's injected `VERCEL=1` marker and a single public `x-vercel-forwarded-for` value. |
 | `CONSENT_SUBJECT_HASH_KEY` | 32 bytes | Keyed, tenant-bound subject identifier hash. |
 | `CONSENT_SIGNATURE_KEY` | 32 bytes | Current evidence HMAC key. |
 | `CONSENT_SIGNATURE_KEY_VERSION` | Positive integer | Stored with new evidence. |
@@ -68,7 +69,7 @@ Start from `.env.example`. Values are loaded from `.env.local` by the local migr
 | `CONSENT_RETENTION_DAYS` | Positive integer | Retention deadline added to the server receive time for new records. |
 | `CERTIFICATE_SHARE_TOKEN_PEPPER` | 32 bytes | Required when externally shared certificate tokens are provisioned/used. |
 
-Use a different secret for every row above and for every environment. An empty optional JSON variable is not equivalent to an absent variable in every parser; leave optional rings commented out until they contain valid JSON.
+Use a different secret for every secret row above and for every environment. An empty optional JSON variable is not equivalent to an absent variable in every parser; leave optional rings commented out until they contain valid JSON. Public capture must run directly on Vercel in this MVP; do not set `VERCEL=1` yourself or trust a header forwarded by another proxy.
 
 ## 3. Database lifecycle
 
@@ -199,7 +200,7 @@ During rotation, add the old key to `CREDENTIAL_ENCRYPTION_KEYS_JSON` before cha
 
 ### DKIM modes
 
-`dkim_mode='local'` requires a selector and `dkimPrivateKey`. The DNS snapshot records its normalized domain, selector, and mode. Before OAuth refresh or SMTP construction, live dispatch requires that exact snapshot to be unique, usable, no more than 24 hours old, and to contain the RSA public key derived from the configured private key. Nodemailer then signs the normal message fields plus both `List-Unsubscribe` and `List-Unsubscribe-Post`.
+`dkim_mode='local'` requires a selector and `dkimPrivateKey`. The DNS snapshot records its normalized domain, selector, and mode. Before OAuth refresh or SMTP construction, live dispatch requires that exact snapshot to be unique, usable, no more than 24 hours old, allow SHA-256 when the `h=` tag is present, allow `email` or `*` when the `s=` tag is present, and contain the RSA public key derived from the configured private key. Nodemailer then signs the normal message fields plus both `List-Unsubscribe` and `List-Unsubscribe-Post`.
 
 `dkim_mode='provider'` does not load a local private key. A selector record must still be present for the DNS gate, but the application can only label it `present_provider_managed`; it does not verify the signature on a delivered message or prove domain alignment. Live transport creation therefore fails closed with `rfc8058_dkim_signing_unverified`. Use `dkim_mode='local'` for live delivery.
 

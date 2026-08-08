@@ -132,7 +132,7 @@ A new record returns 201; an idempotent replay returns 200 with `created: false`
 }
 ```
 
-Operational error codes include invalid request/site, inactive site, origin/form/disclosure mismatch, rate limiting, idempotency conflict, and evidence verification failure. A rate-limited request returns HTTP 429 with `Retry-After`. Do not turn a rejected capture into a local “success” record; surface or queue the failure with the same idempotency key.
+Operational error codes include invalid request/site, inactive site, origin/form/disclosure mismatch, unavailable trusted source, rate limiting, idempotency conflict, and evidence verification failure. A rate-limited request returns HTTP 429 with `Retry-After`; missing verified source evidence returns HTTP 503 with `source_unavailable`. Do not turn a rejected capture into a local “success” record; surface or queue the failure with the same idempotency key.
 
 ### Idempotency
 
@@ -140,7 +140,9 @@ The idempotency key is 8–128 characters from the accepted identifier alphabet.
 
 ### Public capture rate limit
 
-The production route uses a durable fixed window: 120 new capture attempts per active tenant/site per minute. Once an idempotency key has produced evidence, its safe retries move to a separate HMAC-keyed bucket capped at 10 per minute, so ordinary retries do not consume the site's new-capture allowance. Bucket keys do not contain raw email, phone, IP, site ID, or idempotency text, and database/decision errors stop capture before evidence persistence.
+The production route uses three durable one-minute fixed windows. Each verified source is capped at 25 requests per active tenant/site across both new captures and completed retries. New captures also share a 120-request tenant/site backstop, so distributed sources cannot create unbounded writes. Completed idempotent retries do not consume that new-capture allowance, but each idempotency key is independently capped at 10 retries. The applicable source-plus-aggregate or source-plus-replay counters are checked and advanced atomically.
+
+Limiter bucket identities are HMACs and do not contain raw email, phone, IP, site ID, or idempotency text. A blocked source does not consume the aggregate allowance, and database/decision uncertainty stops capture before evidence persistence.
 
 Expired bucket rows are indexed by `expires_at`, but the MVP has no automatic pruning job. Include bounded expired-row pruning in controlled database maintenance and monitor table growth; pruning old buckets does not alter immutable consent evidence.
 
@@ -155,9 +157,9 @@ The service normalizes and binds the registered site to a canonical JSON documen
 - affirmative-action label and form URL;
 - request Origin, user agent, occurred/received timestamps;
 - request fingerprint and retention deadline;
-- trusted network provenance only when a trusted-edge resolver supplies it.
+- trusted network provenance supplied by the configured trusted-edge resolver.
 
-The default production route does not accept browser-provided forwarding headers as trusted IP evidence and currently stores null network provenance unless a trusted edge integration is explicitly wired. Do not claim an IP address was captured when the certificate says otherwise.
+The production route currently supports only a deployment directly on Vercel. It requires `CONSENT_TRUSTED_EDGE_PROVIDER=vercel`, verifies Vercel's `VERCEL=1` runtime marker, and accepts only one public address from `x-vercel-forwarded-for`. It ignores ordinary `x-forwarded-for` input, comma-separated chains, and private/reserved addresses. Without this verified source, capture returns `source_unavailable` before site lookup or persistence. A self-hosted or separately proxied deployment needs a new, provider-specific trusted-edge adapter; do not imitate Vercel's marker or header.
 
 The canonical document is:
 
