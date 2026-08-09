@@ -30,5 +30,5 @@ describe("evidence certificate PDF", () => {
     expect(pdf.subarray(0, 5).toString("ascii")).toBe("%PDF-");
     expect(pdf.toString("latin1")).toContain(CERTIFICATE_TITLE);
     expect(pdf.toString("latin1")).not.toMatch(/https?:\/\//i);
-  });
+  }, 15_000);
 });

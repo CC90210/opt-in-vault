@@ -42,6 +42,22 @@ function countResult(
   return integer(row.total, field);
 }
 
+function jsonStringArray(value: unknown, field: string): string[] {
+  const raw = text(value, field);
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (
+      !Array.isArray(parsed) ||
+      !parsed.every((entry) => typeof entry === "string")
+    ) {
+      throw new Error();
+    }
+    return parsed;
+  } catch {
+    throw new Error(`Dashboard ${field} is invalid`);
+  }
+}
+
 export async function getDashboardSnapshot(client: Client, tenantId: string) {
   const [summary, events] = await Promise.all([
     client.execute({
@@ -273,6 +289,50 @@ export async function getConsentRecords(client: Client, tenantId: string) {
           : text(row.certificate_id, "certificate id"),
     })),
     total: countResult(count.rows, "consent total"),
+  };
+}
+
+export async function getCaptureSites(client: Client, tenantId: string) {
+  const [result, count] = await Promise.all([
+    client.execute({
+      sql: `
+      SELECT id, name, public_key_prefix, allowed_origins_json,
+             form_url_pattern, disclosure_version, channels_json, status,
+             created_at
+      FROM capture_sites
+      WHERE tenant_id = ?
+      ORDER BY created_at DESC
+      LIMIT 200
+    `,
+      args: [tenantId],
+    }),
+    client.execute({
+      sql: "SELECT COUNT(*) AS total FROM capture_sites WHERE tenant_id = ?",
+      args: [tenantId],
+    }),
+  ]);
+  return {
+    items: result.rows.map((row) => ({
+      id: text(row.id, "capture site id"),
+      name: text(row.name, "capture site name"),
+      publicKeyPrefix: text(row.public_key_prefix, "capture site key prefix"),
+      allowedOrigins: jsonStringArray(
+        row.allowed_origins_json,
+        "capture site allowed origins",
+      ),
+      formUrlPattern:
+        row.form_url_pattern == null
+          ? null
+          : text(row.form_url_pattern, "capture site form URL rule"),
+      disclosureVersion: text(
+        row.disclosure_version,
+        "capture site disclosure version",
+      ),
+      channels: jsonStringArray(row.channels_json, "capture site channels"),
+      status: text(row.status, "capture site status"),
+      createdAt: integer(row.created_at, "capture site creation time"),
+    })),
+    total: countResult(count.rows, "capture site total"),
   };
 }
 
