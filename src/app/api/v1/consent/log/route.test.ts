@@ -125,7 +125,7 @@ describe("POST /api/v1/consent/log", () => {
 
   it("trusts only a single public direct-Vercel source header when explicitly configured", async () => {
     expect(() => createConfiguredTrustedEdgeResolver({ VERCEL: "1" })).toThrow(
-      /CONSENT_TRUSTED_EDGE_PROVIDER=vercel/,
+      /must be 'vercel' or 'cloudflare'/,
     );
     expect(() =>
       createConfiguredTrustedEdgeResolver({
@@ -159,6 +159,68 @@ describe("POST /api/v1/consent/log", () => {
         request({ "x-vercel-forwarded-for": "127.0.0.1" }),
       ),
     ).toBeUndefined();
+  });
+
+  it("requires an operator attestation before trusting the Cloudflare edge", () => {
+    expect(() =>
+      createConfiguredTrustedEdgeResolver({
+        CONSENT_TRUSTED_EDGE_PROVIDER: "cloudflare",
+      }),
+    ).toThrow(/CONSENT_EDGE_ATTESTATION_SECRET/);
+
+    // A short value is a placeholder somebody pasted to make the error go away.
+    // Accepting it would record consent IPs under an attestation nobody meant.
+    expect(() =>
+      createConfiguredTrustedEdgeResolver({
+        CONSENT_TRUSTED_EDGE_PROVIDER: "cloudflare",
+        CONSENT_EDGE_ATTESTATION_SECRET: "too-short",
+      }),
+    ).toThrow(/at least 32 characters/);
+
+    expect(() =>
+      createConfiguredTrustedEdgeResolver({
+        CONSENT_TRUSTED_EDGE_PROVIDER: "aws",
+        CONSENT_EDGE_ATTESTATION_SECRET: "x".repeat(32),
+      }),
+    ).toThrow(/must be 'vercel' or 'cloudflare'/);
+  });
+
+  it("trusts cf-connecting-ip only when the request actually traversed the Cloudflare edge", async () => {
+    const resolver = createConfiguredTrustedEdgeResolver({
+      CONSENT_TRUSTED_EDGE_PROVIDER: "cloudflare",
+      CONSENT_EDGE_ATTESTATION_SECRET: "attestation-secret-of-sufficient-length",
+    });
+
+    // `cf` is a runtime property the Cloudflare edge synthesises. A client can
+    // send any header it likes, but it cannot manufacture this object.
+    const edged = (headers: Record<string, string>) =>
+      Object.defineProperty(request(headers), "cf", {
+        value: { colo: "YYZ" },
+        configurable: true,
+      });
+
+    expect(await resolver.getClientIp(edged({ "cf-connecting-ip": "8.8.8.8" }))).toEqual({
+      ip: "8.8.8.8",
+      source: "cloudflare",
+    });
+
+    // THE ONE THAT MATTERS: a caller that forges the header but never went
+    // through the edge must yield nothing. If this ever returns an IP, the
+    // consent record's provenance is attacker-controlled and the whole trust
+    // model is decorative.
+    expect(
+      await resolver.getClientIp(request({ "cf-connecting-ip": "8.8.8.8" })),
+    ).toBeUndefined();
+
+    // A chain means something appended rather than replaced, so no single party
+    // is attributable — same rule the Vercel provider applies.
+    expect(
+      await resolver.getClientIp(edged({ "cf-connecting-ip": "8.8.8.8, 1.1.1.1" })),
+    ).toBeUndefined();
+    expect(
+      await resolver.getClientIp(edged({ "cf-connecting-ip": "127.0.0.1" })),
+    ).toBeUndefined();
+    expect(await resolver.getClientIp(edged({}))).toBeUndefined();
   });
 
   it("maps validation/auth/conflict failures without leaking details and disables caching", async () => {

@@ -7,6 +7,7 @@
 ## 1. Executive Summary & Architecture
 
 **Opt-in Vault** is a high-reliability, compliance-grade outbound campaign engine and tamper-evident consent-evidence repository. It replaces third-party tools like Instantly or Smartlead while providing verifiable legal compliance (TCPA, CASL, CAN-SPAM, GDPR) via cryptographic consent signatures and RFC 8058 one-click unsubscribe handling.
+https://github.com/CC90210/opt-in-vault
 
 ### Core Stack
 - **Framework:** Next.js 15 (App Router, React 19, Server Components & Server Actions)

@@ -23,7 +23,7 @@
     "imapflow": "^1.6.6",
     "lucide-react": "^0.468.0",
     "mailparser": "^3.9.15",
-    "next": "15.5.23",
+    "next": "^15.5.24",
     "nodemailer": "^9.0.5",
     "react": "19.2.4",
     "react-dom": "19.2.4",
@@ -33,6 +33,7 @@
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3.3.6",
+    "@opennextjs/cloudflare": "^1.20.4",
     "@tailwindcss/postcss": "^4.1.12",
     "@testing-library/dom": "^10.4.1",
     "@testing-library/jest-dom": "^6.8.0",
@@ -51,7 +52,8 @@
     "jsdom": "^27.0.0",
     "tailwindcss": "^4.1.12",
     "typescript": "^5.9.2",
-    "vitest": "^4.1.7"
+    "vitest": "^4.1.7",
+    "wrangler": "^4.127.1"
   },
   "overrides": {
     "@esbuild-kit/core-utils": {

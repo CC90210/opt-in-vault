@@ -31,30 +31,91 @@ type TrustedEdgeEnvironment = {
   [name: string]: string | undefined;
   CONSENT_TRUSTED_EDGE_PROVIDER?: string;
   VERCEL?: string;
+  CONSENT_EDGE_ATTESTATION_SECRET?: string;
 };
+
+/** Length below which an attestation secret is assumed to be a placeholder. */
+const MIN_ATTESTATION_SECRET_LENGTH = 32;
+
+/**
+ * An IP is only admissible as evidence if the edge that reported it also
+ * overwrites whatever the client sent. Both providers below satisfy that; the
+ * shared validation is here so neither can quietly drift from the other.
+ *
+ * A comma means the header carries a chain, which means something between the
+ * client and us appended rather than replaced — that value is not attributable
+ * to a single party, so it is not evidence.
+ */
+function admissibleIp(raw: string | null | undefined): string | undefined {
+  const value = raw?.trim();
+  if (!value || value.length > 64 || value.includes(",") || !isPublicIpAddress(value)) {
+    return undefined;
+  }
+  return value;
+}
+
+/**
+ * Cloudflare exposes an `cf` object on the incoming request. It is a runtime
+ * property synthesised by the edge, NOT a header — so unlike any `x-*` value it
+ * cannot be set by a client, and its presence is positive proof the request
+ * actually traversed Cloudflare rather than arriving at a bare origin.
+ */
+function traversedCloudflareEdge(request: Request): boolean {
+  return typeof (request as { cf?: unknown }).cf === "object"
+    && (request as { cf?: unknown }).cf !== null;
+}
 
 export function createConfiguredTrustedEdgeResolver(
   environment: TrustedEdgeEnvironment = process.env,
 ): TrustedEdgeResolver {
-  if (environment.CONSENT_TRUSTED_EDGE_PROVIDER !== "vercel") {
-    throw new Error(
-      "CONSENT_TRUSTED_EDGE_PROVIDER=vercel is required for public consent capture.",
-    );
+  const provider = environment.CONSENT_TRUSTED_EDGE_PROVIDER;
+
+  if (provider === "vercel") {
+    if (environment.VERCEL !== "1") {
+      throw new Error(
+        "The Vercel trusted-edge provider can only run directly on Vercel.",
+      );
+    }
+    return {
+      getClientIp(request) {
+        const ip = admissibleIp(request.headers.get("x-vercel-forwarded-for"));
+        return ip ? { ip, source: "vercel" } : undefined;
+      },
+    };
   }
-  if (environment.VERCEL !== "1") {
-    throw new Error(
-      "The Vercel trusted-edge provider can only run directly on Vercel.",
-    );
+
+  if (provider === "cloudflare") {
+    // Two independent conditions, because either one alone is insufficient.
+    //
+    // The secret is the OPERATOR'S ATTESTATION: a deliberate, revocable
+    // statement that this deployment is meant to sit behind the trusted edge.
+    // It is what makes the trust model auditable — a consent record's IP is
+    // only defensible if someone accountable asserted where it came from — and
+    // it is why a local, preview, or re-hosted build fails closed instead of
+    // silently trusting a header it should not.
+    //
+    // `request.cf` is the MACHINE'S PROOF: the attestation says where this is
+    // supposed to run; `cf` proves where the request actually came from. An
+    // operator can misconfigure the first. Nobody can forge the second.
+    const attestation = environment.CONSENT_EDGE_ATTESTATION_SECRET?.trim();
+    if (!attestation || attestation.length < MIN_ATTESTATION_SECRET_LENGTH) {
+      throw new Error(
+        "CONSENT_EDGE_ATTESTATION_SECRET of at least "
+        + `${MIN_ATTESTATION_SECRET_LENGTH} characters is required to attest the Cloudflare trusted edge.`,
+      );
+    }
+    return {
+      getClientIp(request) {
+        if (!traversedCloudflareEdge(request)) return undefined;
+        const ip = admissibleIp(request.headers.get("cf-connecting-ip"));
+        return ip ? { ip, source: "cloudflare" } : undefined;
+      },
+    };
   }
-  return {
-    getClientIp(request) {
-      const raw = request.headers.get("x-vercel-forwarded-for")?.trim();
-      if (!raw || raw.length > 64 || raw.includes(",") || !isPublicIpAddress(raw)) {
-        return undefined;
-      }
-      return { ip: raw, source: "vercel" };
-    },
-  };
+
+  throw new Error(
+    "CONSENT_TRUSTED_EDGE_PROVIDER must be 'vercel' or 'cloudflare' for public consent capture.",
+  );
 }
 
 class ConsentBodyReadError extends Error {

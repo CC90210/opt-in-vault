@@ -69,3 +69,6 @@ id_ed25519
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+.open-next/
+.wrangler/

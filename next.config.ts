@@ -37,6 +37,13 @@ function securityHeaders(): Array<{ key: string; value: string }> {
 }
 
 const nextConfig: NextConfig = {
+  // Next's output tracing drops @libsql/isomorphic-ws, the WebSocket shim
+  // hrana-client imports, which breaks the OpenNext/Cloudflare bundle step.
+  // Its workerd export is a dependency-free wrapper, so force-including it is
+  // safe on every target. Same fix as breeze-portal and ig-setter-pro.
+  outputFileTracingIncludes: {
+    "/**/*": ["./node_modules/@libsql/isomorphic-ws/**/*"],
+  },
   async headers() {
     return [{ source: "/:path*", headers: securityHeaders() }];
   },
