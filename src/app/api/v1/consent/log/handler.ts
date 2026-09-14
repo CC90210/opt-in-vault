@@ -158,16 +158,37 @@ export function createConsentLogHandlers(
 ) {
   return {
     async POST(request: Request): Promise<Response> {
+      /*
+       * EVERY response on this route carries access-control-allow-origin, not
+       * just the successful one.
+       *
+       * Until 2026-09-14 only 2xx and rate_limited did. Every other rejection
+       * came back without it, so a browser could not read the body and surfaced
+       * the whole thing as an opaque CORS failure. SunBiz's capture site had
+       * `form_url_pattern` pointing at a host its merchants no longer landed on,
+       * so EVERY capture was refused 422 form_url_mismatch — and the integrating
+       * app could only see "blocked by CORS policy". The evidence the disclosure
+       * asserts was never being written, and the one line that said why was the
+       * line the browser was not allowed to read.
+       *
+       * A diagnostic that is unreadable by the only client that can act on it is
+       * not a diagnostic. Reflecting the origin here leaks nothing — the body is
+       * a fixed error code, the OPTIONS handler already reflects any origin, and
+       * authorization is unchanged: a caller still gets 401/403 without a valid
+       * site key and matching origin. It only makes the refusal legible.
+       */
+      const origin = request.headers.get("origin") ?? "";
+      const fail = (body: unknown, status: number) => json(body, status, origin || undefined);
+
       const contentType = request.headers.get("content-type") ?? "";
       const mediaType = contentType.split(";", 1)[0]?.trim().toLowerCase();
       if (mediaType !== "application/json") {
-        return json({ error: "invalid_request" }, 415);
+        return fail({ error: "invalid_request" }, 415);
       }
       const siteKey = captureCredential(request);
-      const origin = request.headers.get("origin") ?? "";
       const idempotencyKey = request.headers.get("idempotency-key") ?? "";
       if (!siteKey || !origin || !idempotencyKey) {
-        return json({ error: "invalid_request" }, 400);
+        return fail({ error: "invalid_request" }, 400);
       }
 
       let body: unknown;
@@ -180,13 +201,13 @@ export function createConsentLogHandlers(
           !Array.isArray(body) &&
           ("tenant_id" in body || "tenantId" in body)
         ) {
-          return json({ error: "invalid_request" }, 400);
+          return fail({ error: "invalid_request" }, 400);
         }
       } catch (error) {
         if (error instanceof ConsentBodyReadError) {
-          return json({ error: "invalid_request" }, error.status);
+          return fail({ error: "invalid_request" }, error.status);
         }
-        return json({ error: "invalid_request" }, 400);
+        return fail({ error: "invalid_request" }, 400);
       }
 
       try {
@@ -216,11 +237,11 @@ export function createConsentLogHandlers(
         );
       } catch (error) {
         if (error instanceof ConsentCaptureError) {
-          const response = json(
-            { error: error.code },
-            statusForError[error.code],
-            error.code === "rate_limited" ? origin : undefined,
-          );
+          // `origin` unconditionally, not only for rate_limited. A capture
+          // refused for a configuration reason — form_url_mismatch,
+          // disclosure_mismatch, origin_not_allowed, site_inactive — is exactly
+          // the case the integrating site must be able to read and act on.
+          const response = json({ error: error.code }, statusForError[error.code], origin);
           if (
             error.code === "rate_limited" &&
             Number.isSafeInteger(error.retryAfterSeconds) &&

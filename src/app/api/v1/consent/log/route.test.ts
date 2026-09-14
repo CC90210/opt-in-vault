@@ -181,6 +181,69 @@ describe("POST /api/v1/consent/log", () => {
     }
   });
 
+  /**
+   * A REFUSAL THE BROWSER CANNOT READ IS NOT A REFUSAL, IT IS AN OUTAGE.
+   *
+   * Until 2026-09-14 only 2xx and rate_limited carried
+   * access-control-allow-origin. Everything else came back without it, so a
+   * browser could not read the body and reported an opaque CORS failure.
+   *
+   * That is not hypothetical. SunBiz's capture site had form_url_pattern
+   * pointing at a host its merchants no longer landed on, so EVERY capture was
+   * refused 422 form_url_mismatch. The integrating app saw only "blocked by CORS
+   * policy", the consent evidence its disclosure asserts was never written, and
+   * the one line that said why was the line the browser was not allowed to read.
+   */
+  it("returns access-control-allow-origin on EVERY rejection, not just success", async () => {
+    const origin = "https://example.test";
+
+    // Configuration refusals — the ones an integrator must be able to act on.
+    for (const code of [
+      "form_url_mismatch",
+      "disclosure_mismatch",
+      "origin_not_allowed",
+      "site_not_found",
+      "site_inactive",
+      "source_unavailable",
+      "idempotency_conflict",
+    ] as const) {
+      const handlers = createConsentLogHandlers({
+        capture: vi.fn().mockRejectedValue(new ConsentCaptureError(code)),
+      });
+      const response = await handlers.POST(request());
+      expect(
+        response.headers.get("access-control-allow-origin"),
+        `${code} must be readable by the browser that caused it`,
+      ).toBe(origin);
+      expect(response.headers.get("vary")).toContain("Origin");
+      expect(await response.json()).toEqual({ error: code });
+    }
+
+    // Malformed requests, refused before the service is ever reached.
+    const handlers = createConsentLogHandlers({ capture: vi.fn() });
+    const wrongMedia = await handlers.POST(request({ "content-type": "text/plain" }));
+    expect(wrongMedia.status).toBe(415);
+    expect(wrongMedia.headers.get("access-control-allow-origin")).toBe(origin);
+
+    const noIdempotency = await handlers.POST(request({ "idempotency-key": "" }));
+    expect(noIdempotency.status).toBe(400);
+    expect(noIdempotency.headers.get("access-control-allow-origin")).toBe(origin);
+
+    const tenantInBody = await handlers.POST(request({}, { tenant_id: "sneaky" }));
+    expect(tenantInBody.status).toBe(400);
+    expect(tenantInBody.headers.get("access-control-allow-origin")).toBe(origin);
+
+    // A request with no Origin at all must NOT grow a reflected header.
+    const originless = new Request("https://vault.example/api/v1/consent/log", {
+      method: "POST",
+      headers: { "content-type": "application/json", "idempotency-key": "x", "x-optinvault-site-key": SITE_KEY },
+      body: "{}",
+    });
+    const noOrigin = await handlers.POST(originless);
+    expect(noOrigin.status).toBe(400);
+    expect(noOrigin.headers.get("access-control-allow-origin")).toBeNull();
+  });
+
   it("enforces the byte cap incrementally when Content-Length is missing", async () => {
     const capture = vi.fn().mockResolvedValue(captureResult);
     const handlers = createConsentLogHandlers({ capture });
